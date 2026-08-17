@@ -1,1 +1,11 @@
-references
+.direnv
+
+# Cloned competitor addons + any WoW API reference material.
+# Read-only reference, never our own history — see references/README.md.
+/references/*
+!/references/README.md
+
+# WoW addon packaging / dev artifacts
+*.zip
+.pkgmeta
+.release/
