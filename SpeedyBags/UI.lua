@@ -1,6 +1,12 @@
 local _, ns = ...
 
-local SLOT_SIZE = 30
+-- Blizzard's real default item-slot size, matching what Count/UpgradeIcon/
+-- IconBorder are actually proportioned for (native atlas sizes, font
+-- sizes). Shrunk to 30 earlier for a denser categorized layout; the user
+-- found icons too small and covered by their own overlay text as a
+-- result -- reverted, since the real problem was fighting Blizzard's
+-- proportions rather than a font-size tweak.
+local SLOT_SIZE = 37
 local SLOT_PAD = 4
 local MARGIN = 12
 local TITLE_HEIGHT = 24
@@ -20,6 +26,14 @@ local SUBCAT_WIDTH = SUBCAT_COLS * SLOT_SIZE + (SUBCAT_COLS - 1) * SLOT_PAD
 
 local frame = CreateFrame("Frame", "SpeedyBagsFrame", UIParent, "BackdropTemplate")
 frame:SetPoint("CENTER")
+-- Bug fixed 2026-08-17, found by the user in-game: frame appeared behind
+-- static UI elements. Same strata as Blizzard's own bag frame (MEDIUM,
+-- confirmed in ContainerFrame.xml -- not the actual issue), but Blizzard's
+-- also sets toplevel="true" (ContainerFrame.xml:290's
+-- ContainerFrameCombinedBags), which auto-raises within its strata; ours
+-- didn't have that, so it sat wherever it happened to land in creation
+-- order relative to other MEDIUM-strata frames.
+frame:SetToplevel(true)
 frame:SetBackdrop({
 	bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
 	edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
@@ -53,8 +67,22 @@ title:SetText("SpeedyBags")
 -- it: the render layer must stop scrambling identity on its own first.
 local slotPool = {}
 local labelPool = {} -- section headers + subcategory labels, keyed by a string tag
+local bgPool = {} -- subcategory group backgrounds, keyed the same way as their label
 local aggregateWidgets = {} -- "empty" / "junk" -> widget
 local nextSlotID = 0
+
+-- A subtle background per subcategory block (LUNA_NOTES.md), just enough
+-- lighter than the frame's own backdrop that adjacent groups read as
+-- visually separate without needing a per-group unique color.
+local function AcquireGroupBackground(key)
+	local bg = bgPool[key]
+	if bg then return bg end
+
+	bg = frame:CreateTexture(nil, "BORDER")
+	bg:SetColorTexture(1, 1, 1, 0.05)
+	bgPool[key] = bg
+	return bg
+end
 
 -- Inherits Blizzard's real ContainerFrameItemButtonTemplate rather than a
 -- plain button. UseContainerItem/PickupContainerItem* are protected --
@@ -83,7 +111,18 @@ local function AcquireSlot(key)
 	-- WhiteIconFrame, ItemButtonTemplate.xml:41), set automatically by
 	-- SetItemButtonQuality and left alone here. Without this, both render
 	-- at once and look like a double border.
-	btn:SetNormalTexture(nil)
+	-- Bug fixed 2026-08-17: SetNormalTexture(nil) crashes -- the Button
+	-- widget's setter genuinely doesn't accept nil (confirmed live, addon
+	-- broke). The real fix, per BetterBags' own documented workaround for
+	-- this exact ContainerFrameItemButtonTemplate quirk
+	-- (references/BetterBags/.claude/rules/item-drawing.md's "Blue Glow
+	-- Empty Slot Taint" section): clear the texture on the region itself,
+	-- then hide it, rather than trying to clear it through SetNormalTexture.
+	local normalTexture = btn:GetNormalTexture()
+	if normalTexture then
+		normalTexture:SetTexture(nil)
+		normalTexture:Hide()
+	end
 
 	slotPool[key] = btn
 	return btn
@@ -118,6 +157,16 @@ end
 -- atlas "bags-greenarrow") -- Pawn itself just toggles this same region on
 -- Blizzard's default bag buttons (PawnBags.lua's UpdateItemButtonUpgradeIcon),
 -- so no new texture is needed here either.
+--
+-- ItemLevel shares Count's own corner (BOTTOMRIGHT) rather than getting
+-- its own, per the user's actual corner-assignment convention (their own
+-- reference screenshot: item level, keystone level, and quantity all
+-- stack in one corner, safe because they never co-occur on the same
+-- item -- equipment's own count is never shown here since it's always 1,
+-- see UI.lua's SetItemButtonCount call). Colored by item quality, same as
+-- the slot's own border -- Count stays plain white -- so the two are
+-- visually distinct at a glance even sharing a corner, same as their
+-- reference setup.
 local function SetEquipmentOverlay(btn, entry)
 	if not entry.isEquipment then
 		btn.UpgradeIcon:Hide()
@@ -131,12 +180,11 @@ local function SetEquipmentOverlay(btn, entry)
 
 	if not btn.ItemLevel then
 		btn.ItemLevel = btn:CreateFontString(nil, "OVERLAY", "NumberFontNormalSmall")
-		-- The only free corner: Count is BOTTOMRIGHT, UpgradeIcon is
-		-- TOPLEFT, IconQuestTexture is top-center (all native
-		-- ContainerFrameItemButtonTemplate positions).
-		btn.ItemLevel:SetPoint("BOTTOMLEFT", 2, 2)
+		btn.ItemLevel:SetPoint("BOTTOMRIGHT", -2, 2)
 	end
 	btn.ItemLevel:SetText(entry.itemLevel or "")
+	local r, g, b = C_Item.GetItemQualityColor(entry.quality or Enum.ItemQuality.Common)
+	btn.ItemLevel:SetTextColor(r, g, b)
 	btn.ItemLevel:Show()
 end
 
@@ -275,17 +323,28 @@ local function SortedKeys(t)
 	return keys
 end
 
--- Renders one subcategory block (label + its items, wrapping within the
--- block if there are more than SUBCAT_COLS) at (x, y). Returns the
--- block's rendered height.
-local function RenderSubcategory(x, y, sectionName, label, entries, usedKeys, usedLabels)
-	local labelKey = "sub:"..sectionName..":"..label
-	local fs = AcquireLabel(labelKey, "GameFontNormalSmall")
+-- Renders one subcategory block (background + label + its items, wrapping
+-- within the block if there are more than SUBCAT_COLS) at (x, y). Returns
+-- the block's rendered height.
+local function RenderSubcategory(x, y, sectionName, label, entries, usedKeys, usedLabels, usedBGs)
+	local rows = math.ceil(#entries / SUBCAT_COLS)
+	local height = SUBCAT_LABEL_HEIGHT + rows * SLOT_SIZE + (rows - 1) * SLOT_PAD
+
+	local groupKey = "sub:"..sectionName..":"..label
+
+	local bg = AcquireGroupBackground(groupKey)
+	bg:ClearAllPoints()
+	bg:SetPoint("TOPLEFT", frame, "TOPLEFT", x - 4, y + 4)
+	bg:SetPoint("BOTTOMRIGHT", frame, "TOPLEFT", x + SUBCAT_WIDTH + 4, y - height - 4)
+	bg:Show()
+	usedBGs[groupKey] = true
+
+	local fs = AcquireLabel(groupKey, "GameFontNormalSmall")
 	fs:ClearAllPoints()
 	fs:SetPoint("TOPLEFT", frame, "TOPLEFT", x, y)
 	fs:SetText(label)
 	fs:Show()
-	usedLabels[labelKey] = true
+	usedLabels[groupKey] = true
 
 	local itemY = y - SUBCAT_LABEL_HEIGHT
 	for i, entry in ipairs(entries) do
@@ -312,15 +371,14 @@ local function RenderSubcategory(x, y, sectionName, label, entries, usedKeys, us
 		btn:Show()
 	end
 
-	local rows = math.ceil(#entries / SUBCAT_COLS)
-	return SUBCAT_LABEL_HEIGHT + rows * SLOT_SIZE + (rows - 1) * SLOT_PAD
+	return height
 end
 
 -- Renders one section (header + its subcategory blocks, wrapping to a new
 -- row of blocks at the frame edge) starting at y. Returns the y to
 -- continue at, unchanged if the section has nothing in it -- empty
 -- sections don't reserve space or show a header.
-local function RenderSection(sectionName, bySubcat, y, usedKeys, usedLabels)
+local function RenderSection(sectionName, bySubcat, y, usedKeys, usedLabels, usedBGs)
 	if not bySubcat or not next(bySubcat) then
 		return y
 	end
@@ -342,7 +400,7 @@ local function RenderSection(sectionName, bySubcat, y, usedKeys, usedLabels)
 			y = y - rowHeight - SUBCAT_PAD_Y
 			rowHeight = 0
 		end
-		local height = RenderSubcategory(x, y, sectionName, subcatName, bySubcat[subcatName], usedKeys, usedLabels)
+		local height = RenderSubcategory(x, y, sectionName, subcatName, bySubcat[subcatName], usedKeys, usedLabels, usedBGs)
 		rowHeight = math.max(rowHeight, height)
 		x = x + SUBCAT_WIDTH + SUBCAT_PAD_X
 	end
@@ -423,11 +481,11 @@ function ns.Refresh()
 	if not frame:IsShown() then return end
 
 	local sections = GroupEntries()
-	local usedKeys, usedLabels = {}, {}
+	local usedKeys, usedLabels, usedBGs = {}, {}, {}
 	local y = -(MARGIN + TITLE_HEIGHT)
 
 	for _, sectionName in ipairs(ns.SECTION_ORDER) do
-		y = RenderSection(sectionName, sections[sectionName], y, usedKeys, usedLabels)
+		y = RenderSection(sectionName, sections[sectionName], y, usedKeys, usedLabels, usedBGs)
 		if sectionName == "Equipment" then
 			y = RenderAggregateRow(y, usedLabels)
 		end
@@ -441,6 +499,11 @@ function ns.Refresh()
 	for key, fs in pairs(labelPool) do
 		if not usedLabels[key] then
 			fs:Hide()
+		end
+	end
+	for key, bg in pairs(bgPool) do
+		if not usedBGs[key] then
+			bg:Hide()
 		end
 	end
 

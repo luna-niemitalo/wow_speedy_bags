@@ -20,12 +20,28 @@ ns.BAG_IDS = {
 -- quality first.
 local JUNK_ICON_CAP = 4
 
+-- "Never merge" only actually makes sense for Weapon/Armor (classID 2/4)
+-- -- the reason two instances of the same itemID need to stay separate is
+-- that each instance can carry different upgrade rank/enchants/sockets
+-- (see Categories.lua's reward-track handling), which is a property of
+-- weapons and armor specifically, not of "has an equip slot" broadly.
+-- Bug fixed 2026-08-16, found by the user in-game: a bare itemEquipLoc
+-- check also matches non-equipment inventory types like INVTYPE_BAG (bag-
+-- shaped Crafting Order reward items, "artisan bags") and INVTYPE_TABARD/
+-- INVTYPE_BODY -- none of which have per-instance state worth preserving,
+-- so they were wrongly kept unmerged even though Categories.lua already
+-- correctly filed them under Misc, not Equipment. classID matches what
+-- Categories.lua checks for its own Equipment-section assignment, so the
+-- two are consistent now, not independently guessing at the same thing.
+local ITEM_CLASS_WEAPON = 2
+local ITEM_CLASS_ARMOR = 4
+
 -- Cheap, synchronous equipment check -- called for every scanned slot
 -- (including ones that just add to an existing merged stack), so it stays
 -- to the one GetItemInfoInstant call it needs and nothing heavier.
 local function IsEquipment(itemID)
-	local _, _, _, itemEquipLoc = C_Item.GetItemInfoInstant(itemID)
-	return itemEquipLoc ~= nil and itemEquipLoc ~= ""
+	local _, _, _, _, _, classID = C_Item.GetItemInfoInstant(itemID)
+	return classID == ITEM_CLASS_WEAPON or classID == ITEM_CLASS_ARMOR
 end
 
 -- Classification facts for an item, gathered once per new entry (never for

@@ -201,6 +201,42 @@ local EXPANSION_LABELS = {
 	[LE_EXPANSION_MIDNIGHT] = "Midnight",
 }
 
+-- "Use:" items (LUNA_NOTES.md) get pulled into their own Misc subcategory
+-- instead of the generic "Miscellaneous" catch-all, so unboxable/openable
+-- items are instantly visible instead of buried in whatever's left over.
+-- Scoped to only the final fallback bucket (below) rather than every item
+-- with a use effect -- consumables/quest items/etc. already have a real
+-- subcategory and shouldn't be reclassified just because they're also
+-- usable. Detected the same way as GetUpgradeTrackName: a
+-- C_TooltipInfo.GetBagItem line, this time matched by text ("Use:" is the
+-- literal prefix Blizzard puts on an item's on-use effect line) since
+-- there's no structured TooltipDataLineType for it the way
+-- ItemUpgradeLevel has one -- untested against a real live tooltip, same
+-- caveat as the track-name parsing. Cached per itemID (not per-instance):
+-- unlike upgrade track, "does this itemID have a use effect" doesn't vary
+-- between two copies of the same item.
+local useEffectCache = {}
+local function HasUseEffect(itemID, bagID, slot)
+	local cached = useEffectCache[itemID]
+	if cached ~= nil then
+		return cached
+	end
+
+	local result = false
+	local data = C_TooltipInfo.GetBagItem(bagID, slot)
+	if data then
+		for _, line in ipairs(data.lines) do
+			if line.leftText and line.leftText:find("^Use:") then
+				result = true
+				break
+			end
+		end
+	end
+
+	useEffectCache[itemID] = result
+	return result
+end
+
 -- @param entry { quality, isBound, ... } -- see Data.lua
 -- @param facts { classID, subClassID, equipLoc, expansionID, isEquipment }
 -- @return section, subcategory
@@ -243,6 +279,11 @@ function ns.Categorize(entry, facts)
 	end
 	if facts.classID == ITEM_CLASS.KEY then
 		return "Misc", "Key"
+	end
+
+	local loc = entry.locations[1]
+	if HasUseEffect(entry.itemID, loc.bag, loc.slot) then
+		return "Misc", "Openable"
 	end
 
 	return "Misc", "Miscellaneous"

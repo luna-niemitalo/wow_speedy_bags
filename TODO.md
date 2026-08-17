@@ -15,10 +15,47 @@ resolved first — don't build past them until that task has a recorded decision
       call `UpdateNewItem` ourselves and "Recent items" tracking isn't real yet —
       suppressed outright rather than left in its broken always-on state. Real bug,
       found by the user in-game, not anticipated.
-- [x] ~~Double border on item slots~~ — resolved 2026-08-16: `AcquireSlot` clears
-      the template's default `NormalTexture` (`Interface\Buttons\UI-Quickslot2`)
-      via `SetNormalTexture(nil)`, keeping only the quality-colored `IconBorder`.
-      Also found by the user in-game.
+- [x] ~~Double border on item slots~~ — resolved 2026-08-17 (corrected twice: the
+      first fix, `SetNormalTexture(nil)`, crashed the addon outright — the setter
+      genuinely doesn't accept nil, confirmed live via `LUNA_NOTES.md`). Real fix:
+      `btn:GetNormalTexture():SetTexture(nil)` then `:Hide()` on the region itself,
+      matching BetterBags' own documented workaround for this exact
+      `ContainerFrameItemButtonTemplate` quirk. Keeps only the quality-colored
+      `IconBorder`. Lesson: I'd already read BetterBags' workaround for this same
+      issue earlier in the session and didn't apply it correctly the first time —
+      worth being more careful cross-referencing prior findings before writing
+      similar fixes.
+- [x] ~~Addon frame rendering behind static UI elements~~ — resolved 2026-08-17:
+      `frame:SetToplevel(true)`, matching Blizzard's own `ContainerFrameCombinedBags`
+      (`ContainerFrame.xml:290`) — same `MEDIUM` strata as Blizzard's bag frame
+      already (not the actual issue), but missing `toplevel` meant no auto-raise
+      within that strata. Found by the user in-game.
+- [x] ~~Icons too small, covered by their own overlay text~~ — resolved 2026-08-17:
+      reverted `SLOT_SIZE` from 30 back to Blizzard's real default 37 — the actual
+      problem was fighting the proportions `Count`/`UpgradeIcon`/`IconBorder` are
+      natively sized for, not a font-size issue. Found by the user in-game.
+- [x] ~~"Use:" items should get their own category ("unboxable items")~~ — resolved
+      2026-08-17: `Categories.lua`'s `HasUseEffect`, scoped to only the final
+      Miscellaneous fallback (not every usable item — consumables/quest items
+      already have a real subcategory). Detected via a `C_TooltipInfo.GetBagItem`
+      line text match for the literal "Use:" prefix (no structured
+      `TooltipDataLineType` for it, unlike `ItemUpgradeLevel`) — same untested-
+      against-a-live-tooltip caveat as the reward-track parsing.
+- [x] ~~Subcategory groups need a visual background to distinguish them~~ — resolved
+      2026-08-17: a subtle (`alpha 0.05` white) background panel per subcategory
+      block, pooled and sized to the block's own computed height.
+- [x] ~~"Artisan bags" (Crafting Order reward containers) not merging despite
+      sharing an itemID~~ — resolved 2026-08-16: `Data.lua`'s `IsEquipment` checked
+      "has any itemEquipLoc," which also matches non-equipment inventory types like
+      `INVTYPE_BAG` (bags), `INVTYPE_TABARD`, `INVTYPE_BODY` — none of which have
+      the per-instance state (upgrade rank/enchants/sockets) that's the actual
+      reason Weapon/Armor stay unmerged. Narrowed to classID 2/4, matching what
+      `Categories.lua` already independently checked for Equipment-section
+      assignment — the two were inconsistent before, now the same check. Also
+      moved item level onto Count's own corner (BOTTOMRIGHT, quality-colored to
+      stay visually distinct from Count's plain white) instead of its own corner,
+      per the user's actual Baganator icon-corner convention (item level/keystone
+      level/quantity share one corner safely since they never co-occur).
 
 ## Tooling
 - [ ] Install `wowlua-ls` in VS Code, confirm real hover/autocomplete on a
@@ -113,3 +150,15 @@ resolved first — don't build past them until that task has a recorded decision
 - [ ] Junk slot count matches actual aggregated junk, no per-item junk slots leak
       through
 - [ ] `luacheck` clean
+
+## Future ideas (not scoped, from LUNA_NOTES.md)
+Explicitly speculative — the user's own framing on the second one was "don't pull
+colors and shit from this, it's literally I made it in paint, so it's shit." Neither
+is a decision, just a direction worth remembering.
+- Per-item label row, same idea as the character-panel equipment list (a
+  subcategory becomes a labeled list instead of an icon grid) — bigger layout
+  change than anything else in this file, would need real design thought, not a
+  quick add.
+- Deduplicate visually-identical items that only differ by a quality-corner tag
+  (e.g. two ore types with the same icon) — concept only, no concrete mechanism
+  worked out yet.
