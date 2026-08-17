@@ -24,6 +24,13 @@ soft-integrating with them (reading their SavedVariables, `## OptionalDeps:` in 
   live client — not cloned here, since `Junk.lua`'s integration reads its
   SavedVariables at runtime rather than studying its code as a one-off reference).
   See `Junk.lua`'s own comments for the exact mechanism and line references.
+- **Pawn** — the upgrade-advisor addon `Pawn.lua` integrates with (green upgrade
+  arrows + item level on equipment slots). Not cloned either, same reasoning as
+  Leatrix_Plus — confirmed via its real installed source
+  (`Interface/AddOns/Pawn/PawnBags.lua` on the live client). Notable: Pawn's own file
+  header there *explicitly documents* the third-party-bag integration contract
+  (`PawnRegisterThirdPartyBag`/`PawnShouldItemLinkHaveUpgradeArrow`) for exactly this
+  use case — nothing to reverse-engineer, just read and follow.
 
 ## Competitor addons (cloned, for behavioral study only)
 

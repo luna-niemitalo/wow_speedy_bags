@@ -78,8 +78,66 @@ local function AcquireSlot(key)
 	btn = CreateFrame("ItemButton", "SpeedyBagsSlot"..nextSlotID, frame, "ContainerFrameItemButtonTemplate")
 	btn:SetSize(SLOT_SIZE, SLOT_SIZE)
 
+	-- Blizzard's default button chrome (Interface\Buttons\UI-Quickslot2),
+	-- not the quality border -- that's IconBorder (Interface\Common\
+	-- WhiteIconFrame, ItemButtonTemplate.xml:41), set automatically by
+	-- SetItemButtonQuality and left alone here. Without this, both render
+	-- at once and look like a double border.
+	btn:SetNormalTexture(nil)
+
 	slotPool[key] = btn
 	return btn
+end
+
+-- ContainerFrameItemButtonMixin:UpdateNewItem (ContainerFrame.lua:1688) is
+-- what would normally show/hide the blue "new item" glow based on
+-- C_NewItems.IsNewItem -- we never call it, since "Recent items" isn't a
+-- real tracked feature yet (see TODO.md), so leaving the glow alone would
+-- mean it never gets cleared at all. Worse, it defaults to shown right
+-- after a reload/relog/character-switch, when the client hasn't yet run
+-- Blizzard's own bag-frame code that would normally clear it (opening the
+-- default bag view, hovering items there -- ContainerFrameItemButtonMixin:
+-- OnUpdate does this on hover, ContainerFrame.lua:1541) -- so every item
+-- shows the glow at once instead of just genuinely-new ones. Replicating
+-- that same clear (RemoveNewItem + hide texture + stop both anims) here
+-- is the correct fix until "Recent items" is real: suppress it outright
+-- rather than leave it in this broken always-on state.
+local function ClearNewItemGlow(btn, bagID, slot)
+	C_NewItems.RemoveNewItem(bagID, slot)
+	btn.NewItemTexture:Hide()
+	btn.BattlepayItemTexture:Hide()
+	if btn.flashAnim:IsPlaying() or btn.newitemglowAnim:IsPlaying() then
+		btn.flashAnim:Stop()
+		btn.newitemglowAnim:Stop()
+	end
+end
+
+-- Item level text + Pawn upgrade arrow, equipment-only (see Data.lua/
+-- Pawn.lua for where entry.itemLevel/isUpgrade come from). UpgradeIcon is
+-- a native ContainerFrameItemButtonTemplate region (ContainerFrame.xml:104,
+-- atlas "bags-greenarrow") -- Pawn itself just toggles this same region on
+-- Blizzard's default bag buttons (PawnBags.lua's UpdateItemButtonUpgradeIcon),
+-- so no new texture is needed here either.
+local function SetEquipmentOverlay(btn, entry)
+	if not entry.isEquipment then
+		btn.UpgradeIcon:Hide()
+		if btn.ItemLevel then
+			btn.ItemLevel:Hide()
+		end
+		return
+	end
+
+	btn.UpgradeIcon:SetShown(entry.isUpgrade == true)
+
+	if not btn.ItemLevel then
+		btn.ItemLevel = btn:CreateFontString(nil, "OVERLAY", "NumberFontNormalSmall")
+		-- The only free corner: Count is BOTTOMRIGHT, UpgradeIcon is
+		-- TOPLEFT, IconQuestTexture is top-center (all native
+		-- ContainerFrameItemButtonTemplate positions).
+		btn.ItemLevel:SetPoint("BOTTOMLEFT", 2, 2)
+	end
+	btn.ItemLevel:SetText(entry.itemLevel or "")
+	btn.ItemLevel:Show()
 end
 
 local function AcquireLabel(key, fontTemplate)
@@ -239,9 +297,11 @@ local function RenderSubcategory(x, y, sectionName, label, entries, usedKeys, us
 		local loc = entry.locations[1]
 		btn:SetBagID(loc.bag)
 		btn:SetID(loc.slot)
+		ClearNewItemGlow(btn, loc.bag, loc.slot)
 		btn:SetItemButtonTexture(entry.icon)
 		btn:SetItemButtonQuality(entry.quality, entry.itemLink)
 		btn:SetItemButtonCount(entry.count > 1 and entry.count or nil)
+		SetEquipmentOverlay(btn, entry)
 
 		btn:ClearAllPoints()
 		btn:SetPoint(

@@ -16,8 +16,8 @@ top of this framework — not yet present.
 
 ## Status
 
-- **Current**: a working, categorized bag UI with a real junk slot in `SpeedyBags/`
-  — five files, each one job:
+- **Current**: a working, categorized bag UI with a real junk slot and Pawn
+  upgrade-advisor integration in `SpeedyBags/` — six files, each one job:
   - `Data.lua` — `Scan()` reads all combined bags (Backpack + Bag_1-4 + ReagentBag)
     into display entries, merging same-itemID non-equipment slots into one visual
     stack (even where the real inventory wouldn't stack them) and counting empty
@@ -39,6 +39,13 @@ top of this framework — not yet present.
     deliberate exception to "no external dependencies" — see DESIGN.md's external-
     integration note: that rule targets other bag addons and Syndicator specifically,
     not complementary QoL addons doing something genuinely different.
+  - `Pawn.lua` — same soft-integration pattern as `Junk.lua`, this time with Pawn's
+    own first-party third-party-bag API (`PawnRegisterThirdPartyBag`,
+    `PawnShouldItemLinkHaveUpgradeArrow`) — Pawn's real source explicitly documents
+    this contract for bag addons, nothing to reverse-engineer. `ns.IsUpgrade(link)`
+    returns true/false/nil (nil = Pawn hasn't resolved it yet, throttled); `Data.lua`
+    schedules one deferred re-scan when that happens instead of leaving arrows stuck
+    unresolved.
   - `UI.lua` — sectioned, flow-wrapped rendering: section headers, subcategory
     label+item blocks wrapping at the frame edge, an aggregate row (Empty count +
     Junk count/sell-value tooltip) positioned between Equipment and Misc (matching
@@ -47,7 +54,14 @@ top of this framework — not yet present.
     for equipment) so scan-order churn can't silently reassign a widget to a
     different item. Item slots inherit Blizzard's real
     `ContainerFrameItemButtonTemplate` so click-to-use/pickup run as untainted
-    Blizzard code — confirmed working in-game (§ Resume). Renders only from
+    Blizzard code — confirmed working in-game (§ Resume). Equipment slots also show
+    Pawn's `UpgradeIcon` (a native template region, no new texture) and item level
+    (`C_Item.GetDetailedItemLevelInfo`, accounts for upgrades unlike the static base
+    ilvl). New-item glow is explicitly suppressed (`ClearNewItemGlow`) since we
+    never call Blizzard's own `UpdateNewItem` and it would otherwise default to
+    shown on everything after a reload; the default button chrome
+    (`NormalTexture`) is cleared too, keeping only the quality-colored `IconBorder`
+    — both real bugs the user hit in-game, not anticipated. Renders only from
     `ns.Model`'s already-scanned state; never scans bags itself.
   - `SpeedyBags.lua` — event wiring: `BAG_UPDATE` is coalesced via `C_Timer.After(0,
     ...)` into a single deferred `ns.Model.Update()` rather than scanning inline in
@@ -93,33 +107,32 @@ top of this framework — not yet present.
 - **Last state**: addon is live and symlinked into the real client
   (`Interface/AddOns/SpeedyBags` → this repo's `SpeedyBags/`, same-machine dev
   workflow, no sync step). Confirmed working in-game through several real
-  iterations: combined-bags MVP → fixed an `ADDON_ACTION_FORBIDDEN` on
-  `UseContainerItem` (confirmed fixed by the user directly — click-to-use/pickup
-  works) → fixed a real identity-swap bug (scan-order-based widget pooling let a
-  newly-appeared item silently take over an existing widget) by keying the pool on
-  stable item identity instead → added full categorization (`Categories.lua` +
-  sectioned `UI.lua` rendering), reversing the original MVP's "no categories"
-  scoping call → added real reward-track detection for Equipment subcategories
-  (`C_TooltipInfo` + `Enum.TooltipDataLineType.ItemUpgradeLevel`, cached per item
-  GUID) after the user corrected an earlier wrong assumption that track names were
-  season-throwaway → added a real Junk slot (`Junk.lua`), soft-integrating with
-  Leatrix_Plus's own `_G.LeaPlusDB` after tracing the user's actual
-  quality-threshold-plus-exclusions vendoring behavior to it directly (an initial
-  guess of Plumber was wrong — checked its real source, ruled it out). `.toc`
-  bumped to `0.3.0-mvp-junk`, loads `Categories.lua`, `Junk.lua`, `Data.lua`,
-  `UI.lua`, `SpeedyBags.lua` in that order, `## OptionalDeps: Leatrix_Plus`. Also
-  pulled a scoped warcraft.wiki.gg mirror (10,157 pages, `references/warcraft-wiki/`,
-  via `scripts/fetch-warcraft-wiki.nu`) and clarified DESIGN.md's "no external
-  dependencies" rule to mean "no other bag addons / Syndicator specifically," not a
-  blanket rule — Leatrix_Plus-style integration is explicitly fine.
-- **Next step**: get the categorized layout + Junk slot in front of the user for a
-  real re-test (visual style, section/subcategory placement, wrapping behavior, and
-  whether the reward-track text-parsing assumption actually matches a live
-  tooltip — none of that has been eyeballed in-game yet, only reasoned through).
-  After that: task 1/2's nav-graph module (`DESIGN.md` invariant 5's
-  `Cursor:Navigate` patch) is the next real architectural step, including finally
-  `nodeignore`-tagging the section-header/subcategory-label/aggregate-row widgets so
-  they don't become directional-nav targets.
+  iterations, including two real visual bugs the user found live and reported
+  directly (not anticipated): a blue "new item" glow on every slot after
+  reload/relog/character-switch (we never call Blizzard's own `UpdateNewItem`, so
+  it defaults to shown; fixed by replicating Blizzard's own clear via
+  `ClearNewItemGlow`) and a double border (Blizzard's default `NormalTexture` button
+  chrome stacking visually with the quality-colored `IconBorder`; fixed by clearing
+  `NormalTexture`, keeping only `IconBorder`). Also added in this pass: Pawn
+  integration (`Pawn.lua`) for upgrade arrows + item level on equipment, using
+  Pawn's own documented third-party-bag API — the Junk slot got its own visual
+  pass too (persistent placeholder with a darkened `bags-junkcoin` badge when
+  empty, real Plumber-style stacked/darkened item icons when occupied, capped at 4
+  during collection itself per the user's own resource-conservation ask, not just
+  at display time). `.toc` bumped to `0.4.0-mvp-pawn`, loads `Categories.lua`,
+  `Junk.lua`, `Pawn.lua`, `Data.lua`, `UI.lua`, `SpeedyBags.lua` in that order,
+  `## OptionalDeps: Leatrix_Plus, Pawn`. Session's earlier milestones (protected-
+  function fix, identity-stable pooling, full categorization, reward-track
+  detection, Junk slot, warcraft.wiki.gg mirror) are unchanged from before — see
+  git log / prior session notes for that history, not repeated here.
+- **Next step**: get this pass's fixes and the Pawn integration in front of the
+  user for a real re-test (does the glow/border fix actually look right; do
+  upgrade arrows and item level render correctly; does the Junk slot's stacked-icon
+  visual actually look like a "pile of junk" as intended). After that: task 1/2's
+  nav-graph module (`DESIGN.md` invariant 5's `Cursor:Navigate` patch) is the next
+  real architectural step, including finally `nodeignore`-tagging the section-
+  header/subcategory-label/aggregate-row widgets so they don't become directional-
+  nav targets.
 - **Hazards**: flake package list is still unverified against actual nixpkgs
   attribute names — `nix flake show`/`nix flake check` fail in the Claude Code
   sandbox environment itself (pre-existing `NIX_STORE` issue unrelated to this
@@ -129,4 +142,7 @@ top of this framework — not yet present.
   cosmetic, not a correctness bug, but will look off until addressed. Reward-track
   name extraction (`Categories.lua`'s `GetUpgradeTrackName`) assumes a tooltip line
   format ("Champion 4/8") that couldn't be verified against a real live tooltip —
-  first thing to check if Equipment subcategories look wrong.
+  first thing to check if Equipment subcategories look wrong. `ClearNewItemGlow`
+  now proactively clears Blizzard's own new-item flag every render — if "Recent
+  items" tracking (still deferred, see TODO.md) gets built later, it needs its own
+  "seen it" state and can't rely on that flag surviving to be checked.

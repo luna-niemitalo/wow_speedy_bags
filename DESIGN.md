@@ -116,23 +116,27 @@ problem the project is trying to avoid (see CLAUDE.md § Purpose). It is not a
 blanket rule against any addon integration.
 
 Complementary QoL addons doing something genuinely different — Leatrix_Plus's junk
-vendoring, Scrappy's scrapping, and similarly-scoped tools — are explicitly fine to
-work *with*, not just read for reference. The real pattern, established by
-`Junk.lua`: read the other addon's own SavedVariables global directly (`_G.LeaPlusDB`
-in this case), verified against its real source on the live client
-(`Interface/AddOns/Leatrix_Plus/Leatrix_Plus.lua` — not a `references/` clone, since
-this is a runtime dependency, not something to study once and reimplement), as a
-**soft, optional** integration — always nil-checked, always falls back to a sane
-default (Blizzard's own bare rule, in `Junk.lua`'s case) when the other addon isn't
-installed or loaded. Never a hard `## Dependencies:` requirement; `## OptionalDeps:`
-in the `.toc` only, so the addon loader gets load order right when both happen to be
-present, without making either mandatory.
+vendoring, Pawn's upgrade advisor, Scrappy's scrapping, and similarly-scoped tools —
+are explicitly fine to work *with*, not just read for reference. The pattern,
+established by `Junk.lua` and repeated by `Pawn.lua`: integrate with the other
+addon's own real, documented mechanism — `Junk.lua` reads Leatrix_Plus's
+SavedVariables global directly (`_G.LeaPlusDB`, verified against its real source on
+the live client, not a `references/` clone, since this is a runtime dependency, not
+something to study once and reimplement); `Pawn.lua` uses Pawn's own first-party
+third-party-bag API (`PawnRegisterThirdPartyBag`/`PawnShouldItemLinkHaveUpgradeArrow`
+— Pawn's own source literally documents this contract for bag-addon authors, so
+there was nothing to reverse-engineer). Both are **soft, optional** integrations —
+always nil/existence-checked, always degrade gracefully (no junk-quality-only
+fallback in `Junk.lua`'s case; simply no upgrade arrows in `Pawn.lua`'s) when the
+other addon isn't installed or loaded. Never a hard `## Dependencies:` requirement;
+`## OptionalDeps:` in the `.toc` only, so the addon loader gets load order right when
+both happen to be present, without making either mandatory.
 
 ## Status
 
 - **Current**: see `CLAUDE.md` § Status for the up-to-date picture — a working
-  categorized bag UI with a real junk slot exists. Nav graph and cursor stability
-  from the invariants above are not built yet.
+  categorized bag UI with a real junk slot and Pawn upgrade-advisor integration
+  exists. Nav graph and cursor stability from the invariants above are not built yet.
 - **Target**: see architecture sketch above. Nav graph (invariant 5) is blocked on
   `TASKS.md` tasks 1/2.
 

@@ -2,17 +2,18 @@
 ## Title: SpeedyBags
 ## Notes: Bag/bank addon with a real controller nav order and non-blocking updates.
 ## Author: Luna Niemitalo
-## Version: 0.3.0-mvp-junk
+## Version: 0.4.0-mvp-pawn
 ## SavedVariables: SpeedyBagsDB
-## OptionalDeps: Leatrix_Plus
+## OptionalDeps: Leatrix_Plus, Pawn
 ## X-License: (unset)
 
 # OptionalDeps (not a hard Dependencies) so the addon loader loads
-# Leatrix_Plus first when both are enabled -- Junk.lua reads its
-# _G.LeaPlusDB SavedVariables global at scan time; without this,
-# load order is arbitrary and LeaPlusDB might not exist yet even when
-# Leatrix_Plus is installed, silently falling back to the bare rule.
-# SpeedyBags loads and works fine without Leatrix_Plus present at all.
+# Leatrix_Plus/Pawn first when present -- Junk.lua reads Leatrix_Plus's
+# _G.LeaPlusDB SavedVariables global, Pawn.lua calls
+# PawnRegisterThirdPartyBag, both at file-load time; without this, load
+# order is arbitrary and either global might not exist yet even when the
+# addon is installed, silently falling back to the bare/no-op behavior.
+# SpeedyBags loads and works fine without either present at all.
 
 # Interface 120100 confirmed 2026-08-16 against the installed retail client
 # (/media/luna/games/World of Warcraft/_retail_/.flavor.info: Version 12.1.0.69299),
@@ -20,6 +21,7 @@
 
 Categories.lua
 Junk.lua
+Pawn.lua
 Data.lua
 UI.lua
 SpeedyBags.lua

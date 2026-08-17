@@ -79,22 +79,28 @@ end
 -- DESIGN.md invariant 3.
 --
 -- Returns:
---   entries    : array of { key, itemID, itemLink, icon, quality, count,
---                            isEquipment, isBound, locations, section,
---                            subcategory }
---                key is a stable identity for the render layer to key
---                pooled widgets on -- see EntryKey above.
---                locations = { { bag, slot, count }, ... } -- real slots
---                backing this entry, in scan order
---   emptyCount : empty slots across all combined bags
---   junkCount  : slots occupied by junk (not merged into entries)
---   junkValue  : total vendor sell price of that junk, in copper
---   junkItems  : up to JUNK_ICON_CAP { icon, quality } pairs, first-
---                encountered in scan order -- already exactly what
---                UI.lua's stacked-icon display needs, no further sorting
---                or capping required on the render side
+--   entries     : array of { key, itemID, itemLink, icon, quality, count,
+--                             isEquipment, isBound, locations, section,
+--                             subcategory, itemLevel?, isUpgrade? }
+--                 key is a stable identity for the render layer to key
+--                 pooled widgets on -- see EntryKey above.
+--                 locations = { { bag, slot, count }, ... } -- real slots
+--                 backing this entry, in scan order.
+--                 itemLevel/isUpgrade are equipment-only (see Pawn.lua);
+--                 isUpgrade can be true, false, or nil (Pawn hasn't
+--                 resolved it yet -- see pawnPending below).
+--   emptyCount  : empty slots across all combined bags
+--   junkCount   : slots occupied by junk (not merged into entries)
+--   junkValue   : total vendor sell price of that junk, in copper
+--   junkItems   : up to JUNK_ICON_CAP { icon, quality } pairs, first-
+--                 encountered in scan order -- already exactly what
+--                 UI.lua's stacked-icon display needs, no further sorting
+--                 or capping required on the render side
+--   pawnPending : true if any equipment item's isUpgrade came back nil --
+--                 Model.Update uses this to schedule one short re-scan
 local function Scan()
 	local entries, byItemID, emptyCount, junkCount, junkValue, junkItems = {}, {}, 0, 0, 0, {}
+	local pawnPending = false
 
 	for _, bagID in ipairs(ns.BAG_IDS) do
 		local numSlots = C_Container.GetContainerNumSlots(bagID)
@@ -133,6 +139,19 @@ local function Scan()
 							locations = { { bag = bagID, slot = slot, count = stackCount } },
 						}
 						entry.section, entry.subcategory = ns.Categorize(entry, GetItemFacts(itemID, isEquipment))
+						if isEquipment then
+							-- actualItemLevel accounts for upgrades/gems,
+							-- unlike GetItemInfo's static base ilvl.
+							entry.itemLevel = C_Item.GetDetailedItemLevelInfo(info.hyperlink)
+							entry.isUpgrade = ns.IsUpgrade(info.hyperlink)
+							if entry.isUpgrade == nil then
+								-- Pawn hasn't resolved this one yet (its
+								-- own per-frame throttle) -- re-scan
+								-- shortly once it has, rather than
+								-- leaving the arrow permanently unset.
+								pawnPending = true
+							end
+						end
 						table.insert(entries, entry)
 						if not isEquipment then
 							byItemID[itemID] = entry
@@ -143,7 +162,7 @@ local function Scan()
 		end
 	end
 
-	return entries, emptyCount, junkCount, junkValue, junkItems
+	return entries, emptyCount, junkCount, junkValue, junkItems, pawnPending
 end
 
 ---------------------------------------------------------------
@@ -170,7 +189,15 @@ function ns.Model.OnChanged(fn)
 end
 
 function ns.Model.Update()
-	ns.Model.entries, ns.Model.emptyCount, ns.Model.junkCount, ns.Model.junkValue, ns.Model.junkItems = Scan()
+	local pawnPending
+	ns.Model.entries, ns.Model.emptyCount, ns.Model.junkCount, ns.Model.junkValue, ns.Model.junkItems, pawnPending = Scan()
+	if pawnPending then
+		-- Pawn couldn't answer for at least one item this pass (its own
+		-- per-frame throttle, see Pawn.lua) -- one short deferred re-scan
+		-- picks up the settled answer instead of leaving upgrade arrows
+		-- unresolved until the next unrelated bag change.
+		C_Timer.After(0.2, ns.Model.Update)
+	end
 	for _, fn in ipairs(listeners) do
 		fn()
 	end

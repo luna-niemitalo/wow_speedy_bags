@@ -8,6 +8,17 @@ resolved first — don't build past them until that task has a recorded decision
       `ContainerFrameItemButtonTemplate`, so clicks are untainted in and out of
       combat. See `DESIGN.md` § Protected functions (taint) for the full story
       (including a wrong first diagnosis, corrected against a real repro).
+- [x] ~~Blue "new item" glow on every slot after reload/relog/character-switch~~ —
+      resolved 2026-08-16: `UI.lua`'s `ClearNewItemGlow` replicates Blizzard's own
+      `ContainerFrameItemButtonMixin:OnUpdate` clear (`C_NewItems.RemoveNewItem` +
+      hide `NewItemTexture` + stop `flashAnim`/`newitemglowAnim`), since we never
+      call `UpdateNewItem` ourselves and "Recent items" tracking isn't real yet —
+      suppressed outright rather than left in its broken always-on state. Real bug,
+      found by the user in-game, not anticipated.
+- [x] ~~Double border on item slots~~ — resolved 2026-08-16: `AcquireSlot` clears
+      the template's default `NormalTexture` (`Interface\Buttons\UI-Quickslot2`)
+      via `SetNormalTexture(nil)`, keeping only the quality-colored `IconBorder`.
+      Also found by the user in-game.
 
 ## Tooling
 - [ ] Install `wowlua-ls` in VS Code, confirm real hover/autocomplete on a
@@ -52,7 +63,19 @@ resolved first — don't build past them until that task has a recorded decision
       `RenderAggregateRow`), count + total sell-value tooltip, no individual junk
       slots rendered.
 - [ ] "Recent items" tracking (`C_NewItems.IsNewItem`) — the reference layout's
-      Empty row is actually a Recent+Empty row; only Empty is implemented so far
+      Empty row is actually a Recent+Empty row; only Empty is implemented so far.
+      Note: `C_NewItems.RemoveNewItem` is now called on every render
+      (`ClearNewItemGlow`), so this would need its own "seen it in SpeedyBags"
+      tracking rather than relying on Blizzard's own new-item flag, which we
+      already clear for the unrelated glow-suppression fix above.
+- [x] ~~Pawn integration (upgrade arrows + item level on equipment)~~ — resolved
+      2026-08-16: `Pawn.lua` uses Pawn's own first-party third-party-bag API
+      (`PawnRegisterThirdPartyBag`/`PawnShouldItemLinkHaveUpgradeArrow` — Pawn's own
+      source documents this contract explicitly). `UpgradeIcon` is a native
+      `ContainerFrameItemButtonTemplate` region, no new texture needed. Item level
+      via `C_Item.GetDetailedItemLevelInfo` (accounts for upgrades, unlike
+      `GetItemInfo`'s static base ilvl). Nil ("Pawn hasn't answered yet") triggers
+      one deferred re-scan rather than leaving arrows unresolved.
 - [ ] Wire render layer to data-layer diffs — patch only changed slots, never a
       full-frame rebuild in the loot/vendor/mail/unbox hot path (invariant 4)
 - [x] ~~Keep slot frame identity stable across content changes~~ — resolved: slot
