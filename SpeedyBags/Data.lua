@@ -85,14 +85,18 @@ local function EntryKey(itemID, isEquipment, bagID, slot)
 	return "item:" .. tostring(itemID)
 end
 
--- Scans every combined bag into display entries, merging same-itemID,
--- non-equipment slots into one entry regardless of whether they're
+-- Scans the given list of bag IDs into display entries, merging same-
+-- itemID, non-equipment slots into one entry regardless of whether they're
 -- stackable in the real inventory. Each entry is classified into a
 -- section/subcategory via Categories.lua -- Data.lua gathers facts,
 -- Categories.lua decides what they mean. Junk (per Junk.lua's rule) never
 -- becomes a displayed entry at all -- it's pulled into an aggregate
 -- count/value instead, same shape as the empty-slot count, per
 -- DESIGN.md invariant 3.
+--
+-- Parameterized on bagIDs (rather than hardcoded to ns.BAG_IDS) so the same
+-- scan/classify machinery serves both the bag view and the bank view
+-- (Bank.lua) -- one scanner, two bag-ID lists, not two scanners.
 --
 -- Returns:
 --   entries     : array of { key, itemID, itemLink, icon, quality, count,
@@ -114,11 +118,11 @@ end
 --                 or capping required on the render side
 --   pawnPending : true if any equipment item's isUpgrade came back nil --
 --                 Model.Update uses this to schedule one short re-scan
-local function Scan()
+local function Scan(bagIDs)
 	local entries, byItemID, emptyCount, junkCount, junkValue, junkItems = {}, {}, 0, 0, 0, {}
 	local pawnPending = false
 
-	for _, bagID in ipairs(ns.BAG_IDS) do
+	for _, bagID in ipairs(bagIDs) do
 		local numSlots = C_Container.GetContainerNumSlots(bagID)
 		for slot = 1, numSlots do
 			local info = C_Container.GetContainerItemInfo(bagID, slot)
@@ -182,39 +186,52 @@ local function Scan()
 end
 
 ---------------------------------------------------------------
--- Model: the actual bag state, independent of rendering.
+-- Model: the actual bag/bank state, independent of rendering.
 ---------------------------------------------------------------
--- ns.Model.entries/emptyCount are the current, already-scanned state --
--- read-only from the UI's perspective. ns.Model.Update() is the only
--- thing that mutates them, and it's the only place a real bag scan
--- happens; ns.Model.OnChanged(fn) subscribes fn to run after every
--- update. Nothing here touches a frame or a widget -- the render layer
--- (UI.lua) is just one listener among however many this ever has.
-ns.Model = {
-	entries = {},
-	emptyCount = 0,
-	junkCount = 0,
-	junkValue = 0,
-	junkItems = {},
-}
+-- A model holds entries/emptyCount/junk* for one combined bag-ID list --
+-- read-only from the UI's perspective. model.Update() is the only thing
+-- that mutates them, and it's the only place a real scan happens;
+-- model.OnChanged(fn) subscribes fn to run after every update. Nothing
+-- here touches a frame or a widget -- the render layer (UI.lua) is just
+-- one listener among however many this ever has.
+--
+-- getBagIDs is a function, not a static list: the bag view's list
+-- (ns.BAG_IDS) never changes at runtime, but the bank view's (Bank.lua's
+-- ns.GetBankBagIDs) depends on which bank tabs are currently purchased,
+-- which can change mid-session -- re-deriving it on every Update() rather
+-- than caching keeps that single-sourced instead of needing its own
+-- change-tracking.
+function ns.NewModel(getBagIDs)
+	local model = {
+		entries = {},
+		emptyCount = 0,
+		junkCount = 0,
+		junkValue = 0,
+		junkItems = {},
+	}
 
-local listeners = {}
+	local listeners = {}
 
-function ns.Model.OnChanged(fn)
-	table.insert(listeners, fn)
+	function model.OnChanged(fn)
+		table.insert(listeners, fn)
+	end
+
+	function model.Update()
+		local pawnPending
+		model.entries, model.emptyCount, model.junkCount, model.junkValue, model.junkItems, pawnPending = Scan(getBagIDs())
+		if pawnPending then
+			-- Pawn couldn't answer for at least one item this pass (its own
+			-- per-frame throttle, see Pawn.lua) -- one short deferred re-scan
+			-- picks up the settled answer instead of leaving upgrade arrows
+			-- unresolved until the next unrelated bag change.
+			C_Timer.After(0.2, model.Update)
+		end
+		for _, fn in ipairs(listeners) do
+			fn()
+		end
+	end
+
+	return model
 end
 
-function ns.Model.Update()
-	local pawnPending
-	ns.Model.entries, ns.Model.emptyCount, ns.Model.junkCount, ns.Model.junkValue, ns.Model.junkItems, pawnPending = Scan()
-	if pawnPending then
-		-- Pawn couldn't answer for at least one item this pass (its own
-		-- per-frame throttle, see Pawn.lua) -- one short deferred re-scan
-		-- picks up the settled answer instead of leaving upgrade arrows
-		-- unresolved until the next unrelated bag change.
-		C_Timer.After(0.2, ns.Model.Update)
-	end
-	for _, fn in ipairs(listeners) do
-		fn()
-	end
-end
+ns.Model = ns.NewModel(function() return ns.BAG_IDS end)

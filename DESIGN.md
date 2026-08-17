@@ -198,7 +198,22 @@ above solves both cleanly with less code than reimplementing either path ourselv
 
 **Known related traps** (from `references/BetterBags/.context/patterns-taint.md`,
 not yet hit by us but worth knowing before touching bank support): assigning to the
-global `_` without `local` taints it and breaks unrelated protected calls elsewhere;
-touching `BankFrame`/`BankPanel` at addon-init time (before the bank is actually
-open) can permanently taint all future `UseContainerItem` calls, even for the
-backpack, because `UseContainerItem` itself reads `BankFrame:GetActiveBankType()`.
+global `_` without `local` taints it and breaks unrelated protected calls elsewhere.
+
+**Corrected 2026-08-17** (`Bank.lua`'s `HideDefaultBank`, user-directed — "explore
+how Baganator does it"): this note previously warned that touching `BankFrame`/
+`BankPanel` at addon-init time, at all, could permanently taint every future
+`UseContainerItem` call, backpack included, because `UseContainerItem` itself reads
+`BankFrame:GetActiveBankType()`. That framing was too broad. Baganator's own real,
+shipped code (`references/Baganator/ViewManagement/Initialize.lua`'s
+`HideDefaultBank`) calls `BankFrame:SetParent(hidden)` and clears its `OnHide`/
+`OnEvent`/`OnShow` scripts unconditionally at addon load — in production, for a
+widely-used addon, with no reported taint fallout. `SpeedyBags/Bank.lua` now does
+the same. The part of the original warning that's still true: what actually taints
+`UseContainerItem` is *reading state back* off `BankFrame`/`BankPanel` (a
+`GetActiveBankType()`-style call) from within a tainted call chain — not structural
+`SetParent`/`SetScript(nil)` calls on the frame object itself. `Bank.lua`'s
+`GetBankBagIDs` avoids the former entirely (driven off `C_Bank`/`C_Container`), so
+this distinction is what makes `HideDefaultBank` safe to add without touching the
+part of the hazard that's real. Not independently verified in-game by us yet —
+adopted on the strength of Baganator's production use, not first-hand confirmation.

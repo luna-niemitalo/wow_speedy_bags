@@ -129,12 +129,22 @@ resolved first — don't build past them until that task has a recorded decision
 - [ ] Monkey-patch `Cursor:Navigate` (`ConsolePort_Cursor/View/Cursor.lua`, via
       `db.Cursor`) — `pcall`/shape-check guarded — to consult the graph first, fall
       through to the original geometric scan per-direction when no edge exists
-- [ ] Tag every non-item-slot frame (category headers, Junk slot if applicable) with
-      `SetAttribute('nodeignore', true)` — mandatory regardless of graph, it's the
-      fallback's correctness net
-- [ ] Tag item slots with `nodepriority` for cursor-stability reselection bias
+- [x] ~~Tag every non-item-slot frame with `nodeignore`~~ — resolved 2026-08-17:
+      the main content frame (both bag and bank views) is `nodeignore`d, since its
+      own drag-enabled backdrop would otherwise be a valid geometric nav candidate
+      alongside the item slots it contains. Category headers/subcategory labels are
+      plain `FontString`s (not mouse-enabled `Frame`s), so `ConsolePortNode` already
+      excludes them by construction — confirmed against `TASKS.md` task 1's finding,
+      no tagging needed there. The Empty aggregate slot is likewise never
+      mouse-enabled, so it's excluded too; Junk stays a valid nav target on purpose
+      (it's actionable — hover shows sell value).
+- [x] ~~Tag item slots with `nodepriority`~~ — resolved 2026-08-17: every pooled
+      item-slot button gets `nodepriority = 1` at creation (`UI.lua`'s
+      `AcquireSlot`), biasing arbitrary/reopen reselection toward real items over
+      other node types — not a full nav graph, just the fallback-net tagging
+      invariant 5 already requires regardless of whether the graph module exists.
 - [ ] Verify fallback path with ConsolePort's Navigate unpatched/absent: nav still
-      resolves cleanly via geometry + the above tags alone
+      resolves cleanly via geometry + the above tags alone — untested in-game yet.
 
 ## Cursor stability
 - [ ] Verify cursor stays on the acted-on slot/stack across loot, sell, mail, and
@@ -150,6 +160,94 @@ resolved first — don't build past them until that task has a recorded decision
 - [ ] Junk slot count matches actual aggregated junk, no per-item junk slots leak
       through
 - [ ] `luacheck` clean
+
+## Currency row
+- [x] ~~Currency/gold row~~ — resolved 2026-08-17, then fixed twice more same
+      session: `Currency.lua` reads gold (`GetMoney()`) plus whatever the player has
+      pinned via Blizzard's own "Show in Backpack" toggle
+      (`C_CurrencyInfo.GetBackpackCurrencyInfo`) — no hardcoded currency list for
+      most of the wishlist (Shard of Dundun's, Restored Coffer Keys, Coffer Key
+      Shards, Remnants of Anguish, Field Accolades — no IDs verifiable from the
+      offline reference mirrors this addon is built against, so guessing them was
+      rejected in favor of Blizzard's real pinning mechanism, same approach
+      Baganator's `CurrencyBlizzardTracking.lua` uses). Renders as a right-to-left
+      row (`UI.lua`'s `RenderCurrencyRow`) at the **bottom** of the frame (moved
+      there from an initial under-the-title placement per the user's in-game
+      feedback) on both the bag view and the bank view. Real bug found by the user
+      in-game: currency icons rendered as empty spots — `CreateTextureMarkup` was
+      called with width/height `0, 0` instead of a real render size, fixed to
+      `12, 12` with a `0.08–0.96` crop inset (Baganator's own working values for
+      this same call). Superseded by a further redesign same session (below):
+      per-currency icons are now real `Texture` widgets, not inline text markup, so
+      they can carry a colored border.
+- [x] ~~Bigger currency icons/font + per-profession color coding~~ — resolved
+      2026-08-17, user feedback after the first real look ("icons are tiny AF" /
+      two Moxie currencies were "the same gray icon twice" with no way to tell them
+      apart without hovering): `UI.lua`'s `RenderCurrencyRow` now builds each
+      non-gold currency widget from a real `Texture` (20px, up from the inline
+      markup's 12px) behind a colored border square (`BORDER_THICKNESS = 3`), font
+      bumped from `GameFontHighlightSmall` to `GameFontHighlight`. Border color
+      comes from `Currency.lua`'s `ns.Currency.professionColor[currencyID]` — one
+      thematic color per Artisan's Moxie profession (potion green for Alchemy,
+      forge red-orange for Blacksmithing, etc.), defined in the same
+      `PROFESSION_MOXIE` table that drives the profession auto-pin, so the
+      skillLine/currencyID/color mapping has one source, not two tables that could
+      drift. Currencies with no mapped color get a neutral gray border rather than
+      no border. Gold keeps Blizzard's own multi-denomination coin markup — not a
+      per-profession currency, nothing to disambiguate.
+- [x] ~~Artisan's Moxie profession auto-pin~~ — resolved 2026-08-17: the user
+      supplied real currency IDs (Alchemist's 3256, Scribe's/Inscription's 3261)
+      and the rest were looked up (Wowhead currency pages) once the
+      3256–3266-alphabetical-by-profession pattern was confirmed against those two
+      known points. `Currency.lua`'s `AutoPinProfessionMoxie` maps
+      `C_TradeSkillUI.GetAllProfessionTradeSkillLines()`'s locale-independent
+      skillLine IDs to the matching Moxie currency and pins it via
+      `C_CurrencyInfo.SetCurrencyBackpackByID` — additive/idempotent, runs on
+      `PLAYER_LOGIN`/`SKILL_LINES_CHANGED`. The other five named currencies still
+      have no verified IDs and are not auto-pinned. Untested against a live client.
+
+## Bank UI
+- [x] ~~Bank view mirroring the bag view~~ — resolved 2026-08-17: `UI.lua`'s
+      `NewBagView` factory now builds both the bag view and a bank view from the
+      same rendering machinery (categorization, junk aggregate, currency row) —
+      one factory, not a copy-pasted second file. `Bank.lua`'s
+      `ns.GetBankBagIDs()` drives it off `C_Bank.FetchPurchasedBankTabIDs` for
+      both `Enum.BankType.Account` (warband bank, listed first per the user's
+      "default to warband bank" direction) and `Enum.BankType.Character`.
+      `GetBankBagIDs` itself never reads state back off the `BankFrame`/
+      `BankPanel` globals, sidestepping the taint hazard `DESIGN.md` documented.
+      Opens/closes on `BANKFRAME_OPENED`/`BANKFRAME_CLOSED`. Reagent Bank needs no
+      separate handling — the modern client folded it into regular character-bank
+      tabs, no
+      distinct `BagIndex` for it anymore. Untested against a live client.
+- [x] ~~Suppress Blizzard's default bank window~~ — resolved 2026-08-17, per the
+      user's explicit direction to check how Baganator does it: `Bank.lua`'s
+      `HideDefaultBank` reparents `BankFrame` onto a hidden frame and clears its
+      `OnHide`/`OnEvent`/`OnShow` scripts at load, matching Baganator's own real,
+      shipped `ViewManagement/Initialize.lua` exactly (`SetParent(hidden)` +
+      clearing those three scripts, called unconditionally at addon init). This
+      corrects this file's earlier, more cautious stance (based on
+      `references/BetterBags/.context/patterns-taint.md`, read as broader than what
+      actually causes trouble) — a widely-used addon doing this in production with
+      no reported taint fallout is stronger evidence than the earlier unverified
+      caution. `GetBankBagIDs` still never *reads* state back off `BankFrame`/
+      `BankPanel` (the part of the taint note that's still true —
+      `BankFrame:GetActiveBankType()`-style reads from a tainted chain), so this
+      addition is additive, not a reversal of that part. Not independently verified
+      in-game by us yet.
+
+## Category headers
+- [x] ~~Collapsible section headers~~ — resolved 2026-08-17: section headers
+      (`UI.lua`'s `AcquireHeaderButton`) are now real `Button`s with a click
+      handler toggling `SpeedyBagsDB.collapsedSections[sectionName]` and
+      re-`Refresh()`ing; a collapsed section still shows its header (so it can be
+      re-expanded) but renders none of its subcategory blocks. Shared between the
+      bag view and the bank view (same SavedVariables key). Being clickable/
+      mouse-enabled makes these exactly the case `TASKS.md` task 1 flagged
+      `nodeignore` as load-bearing for — plain `FontString` labels are excluded
+      from ConsolePort's candidate scan automatically, but a real `Button` is not,
+      so `AcquireHeaderButton` sets `nodeignore` explicitly. Untested against a
+      live client.
 
 ## Future ideas (not scoped, from LUNA_NOTES.md)
 Explicitly speculative — the user's own framing on the second one was "don't pull
