@@ -3,6 +3,66 @@
 Ordered checklist. Items tagged `(task N)` still need their `TASKS.md` investigation
 resolved first — don't build past them until that task has a recorded decision.
 
+## Live testing findings, 2026-08-17 (partially fixed)
+
+Reported directly by the user while testing in-game, same session as the masonry/tabs
+work above.
+
+- [x] ~~Right-click category transfer only moves the first item~~ — resolved
+      2026-08-17: `Transfer.lua`'s `ns.TransferEntries` rebuilt from one synchronous
+      loop into a step-driven queue (`BuildQueue`/`StepQueue`), matching Baganator's
+      own real `Transfers/FromBagsToBags.lua` shape — one pickup/place pair per step,
+      each step waiting a full frame (`C_Timer.After(0, ...)`) before starting the
+      next, instead of assuming `PickupContainerItem` is instant and chaining every
+      pair in one Lua call. Each step also re-checks the source slot
+      (`C_Container.GetContainerItemInfo`) before acting, since an earlier step in the
+      same transfer can shift bag contents. Untested against a live client — the
+      diagnosis (confirmed against Baganator's real code) is solid, but this specific
+      fix hasn't had an in-game pass yet.
+- [x] ~~Category transfer leaves "ghost" items in the render~~ — resolved 2026-08-17,
+      same fix as above: `Transfer.lua`'s `RescanAllModels()` calls all three models'
+      `Update()` (`ns.Model`, `ns.PersonalBankModel`, `ns.WarbandBankModel`) once the
+      step queue drains (or hits combat lockdown / no-space), so the view reflects
+      real state instead of the stale picture the original click's `Refresh()` was
+      taken from. Refreshing all three unconditionally rather than tracking exactly
+      which two were involved is simpler and still correct — `Update()` is a cheap
+      re-scan on an unaffected model. Untested against a live client.
+- **Right-click category transfer while Personal Bank is selected tries to move items
+  to Warband Bank instead.** Re-examined 2026-08-17 while fixing the two bugs above:
+  by inspection, `UI.lua`'s `ns.BankView` instantiation sets BOTH bank groups'
+  `transferTargetBagIDs` to `function() return ns.BAG_IDS end` (character bags, not
+  the other bank) for either tab, and the tab-switch `OnClick` handler
+  (`UI.lua:395-398`) calls `Refresh()` synchronously, which reassigns every pooled
+  header/subcategory-label button's `.transferTargetBagIDs` field on every render —
+  no stale-closure path found. Most likely this actually was a symptom of the
+  now-fixed synchronous-loop bug above (state readable mid-corruption during a
+  same-frame multi-`PickupContainerItem` burst), but that's inference, not a
+  confirmed root cause — genuinely re-check this specifically on the next in-game
+  pass before assuming the transfer-queue fix cleared it too.
+- **Bank → bag single-item moves also leave a ghost in the bank view.** Still
+  unfixed, still a separate question from the category-transfer ghosting above (that
+  one's root cause — `Transfer.lua` never re-scanning after a move — is now fixed;
+  this one is about plain drag-and-drop, which never goes through `Transfer.lua` at
+  all). `SpeedyBags.lua` already routes `PLAYERBANKSLOTS_CHANGED`/
+  `PLAYER_ACCOUNT_BANK_TAB_SLOTS_CHANGED` to the matching bank model's scheduler
+  unconditionally (not gated on the bank view's visibility, same as every other
+  scheduler), so by inspection this *should* already self-correct — but that's
+  exactly what was true of the transfer-ghosting bug too before it was traced to a
+  real gap. Needs its own live-client look, not assumed fixed by inspection.
+- **Masonry recomputes on every item change and it's "*massively*" slow.** Partially
+  addressed 2026-08-17: `UI.lua`'s `NewBagView` now debounces `Refresh()` itself
+  (`ScheduleRefresh`, a `C_Timer.NewTimer(0.1, ...)` that cancels and reschedules on
+  every subsequent model change) instead of calling it directly from every model's
+  `OnChanged`, so a rapid burst of model updates spread across several frames (mass
+  loot/vendor/mail/unbox) collapses into one trailing render instead of one full
+  masonry pack per update. This does NOT fix the deeper issue — `RenderSection`'s
+  column-height loop still walks every subcategory in every section on that one
+  render, not just the part that changed — that's still DESIGN.md's own stated target
+  architecture ("patch only affected slots"), gated on the still-open task 3
+  investigation, not something this pass rebuilt. Whether 0.1s trailing-debounce
+  actually reads as responsive rather than laggy is itself untested against a live
+  client — first thing to tune if the window feels sluggish to update while open.
+
 ## Known gaps
 - [x] ~~In-combat item use/pickup~~ — resolved: slot buttons inherit Blizzard's real
       `ContainerFrameItemButtonTemplate`, so clicks are untainted in and out of
@@ -98,13 +158,37 @@ resolved first — don't build past them until that task has a recorded decision
 - [x] ~~Junk aggregate slot widget (count/space-consumed, not per-item)~~ —
       resolved 2026-08-16: shares a row with the Empty widget (`UI.lua`'s
       `RenderAggregateRow`), count + total sell-value tooltip, no individual junk
-      slots rendered.
-- [ ] "Recent items" tracking (`C_NewItems.IsNewItem`) — the reference layout's
-      Empty row is actually a Recent+Empty row; only Empty is implemented so far.
-      Note: `C_NewItems.RemoveNewItem` is now called on every render
-      (`ClearNewItemGlow`), so this would need its own "seen it in SpeedyBags"
-      tracking rather than relying on Blizzard's own new-item flag, which we
-      already clear for the unrelated glow-suppression fix above.
+      slots rendered. That row later grew Recent and Quest too (see Layout and
+      Known-gaps entries below) -- same function, same shape.
+- [x] ~~"Recent items" tracking~~ — resolved 2026-08-17: since `ClearNewItemGlow`
+      already erases `C_NewItems`' own flag on every render, `Data.lua`'s
+      `NewRecentTracker` keeps its own session-only notion of "recent" instead —
+      diffs each model's own scan history (a key that's new, or whose count went
+      up) rather than reading Blizzard's flag back. Timestamped with `GetTime()`,
+      pruned after `RECENT_WINDOW_SECONDS` (300s), capped at `RECENT_ICON_CAP` (6),
+      newest-first. A guarded "first scan establishes the baseline, doesn't flag
+      anything" case was needed -- caught before shipping, not after: without it,
+      the very first `Update()` (addon load) would have had no `previousCounts` to
+      diff against and flagged the entire bag as Recent at once. Renders as real,
+      individually-clickable item slots (`UI.lua`'s `RenderAggregateRow`,
+      `ConfigureItemSlot` shared with `RenderSubcategory`) in the same row as Empty
+      and Junk, keyed `"recent:"..entry.key` since the same item can legitimately
+      be showing in its normal category grid at the same time (two separate
+      widgets, one underlying bag slot). One self-scheduled re-`Update()` after the
+      window elapses, so an item ages out of Recent even with no further bag
+      activity to trigger it naturally. Untested against a live client.
+- [x] ~~Quest item badge/hide~~ — resolved 2026-08-17, user request: an *inactive*
+      quest item (`C_Container.GetContainerItemQuestInfo`'s `isQuestItem` true,
+      `isActive` false -- nothing to Use yet) is pulled out of the normal grid into
+      a collapsed aggregate badge (`Data.lua`'s `Scan`, same shape as Junk --
+      `questCount`/`questItems`, capped stacked-icon display via the renamed
+      `ICON_STACK_CAP`), sharing the Empty/Junk row. An *active* one (has a real
+      Use action) stays a normal, fully visible entry and gets Blizzard's own
+      quest-bang/border overlay for free via `btn:UpdateQuestItem(...)` -- a native
+      `ContainerFrameItemButtonTemplate` method, the same call Blizzard's own
+      `ContainerFrame.lua` makes, not a new texture. No addon dependency: entirely
+      native API, unlike Junk/Pawn's soft integrations. Untested against a live
+      client.
 - [x] ~~Pawn integration (upgrade arrows + item level on equipment)~~ — resolved
       2026-08-16: `Pawn.lua` uses Pawn's own first-party third-party-bag API
       (`PawnRegisterThirdPartyBag`/`PawnShouldItemLinkHaveUpgradeArrow` — Pawn's own
@@ -235,6 +319,200 @@ resolved first — don't build past them until that task has a recorded decision
       `BankFrame:GetActiveBankType()`-style reads from a tainted chain), so this
       addition is additive, not a reversal of that part. Not independently verified
       in-game by us yet.
+
+## Layout: scrolling, dynamic columns, subcategory ordering
+- [x] ~~Bank view overflowing the screen~~ — resolved 2026-08-17, user report (with
+      screenshot -- five full-width subcategory blocks spilling past the frame
+      edge, no way to see the rest): `UI.lua`'s `NewBagView` now wraps everything
+      below the title in a real `ScrollFrame` (`UIPanelScrollFrameTemplate` --
+      Blizzard's soft-deprecated-in-favor-of-ScrollBox but still-shipped scroll
+      widget; kept anyway since ScrollBox's element-virtualization is built for a
+      uniform list of rows, not this frame's mixed-height flow layout) over a
+      `content` child frame everything actually renders into. The outer frame
+      still sizes snugly to its natural content height when everything fits (same
+      "no wasted space" as before), now clamped at `MAX_VIEW_HEIGHT` (640) instead
+      of growing without bound -- content beyond that scrolls.
+      `scrollFrame.scrollBarHideable = true` hides the slider entirely when
+      there's nothing to scroll, so the bag view (which usually fits) doesn't grow
+      a permanently-disabled scrollbar.
+- [x] ~~Currency row swallowed by the scroll/dynamic layout~~ — resolved 2026-08-17,
+      user correction mid-implementation: the currency row is deliberately NOT
+      part of the scrolled `content` ("it's more of a part of the frame than an
+      actual element") -- it stays parented directly to the outer `frame`,
+      anchored fixed to `frame`'s `BOTTOMLEFT`, with the scrollFrame's own bottom
+      anchor pulled up to leave room for it. Gold/currency stays visible
+      regardless of scroll position.
+- [x] ~~Fixed subcategory columns wasting horizontal space~~ — resolved 2026-08-17,
+      user report (screenshot: "Parts"/"Optional Reagents" with only a handful of
+      items still reserving a full 4-wide block's worth of space, crowding out how
+      many blocks fit per row): `UI.lua`'s `SubcatCols(entries)` caps a block's
+      column count at `min(SUBCAT_COLS, #entries)` instead of always using the
+      max -- a block only takes as much width as it actually needs.
+      `RenderSubcategory`/`RenderSection` were reworked to compute and use each
+      block's own width for wrapping instead of a single constant `SUBCAT_WIDTH`.
+- [x] ~~Alphabetical subcategory ordering~~ — resolved 2026-08-17, user request
+      ("reasonable ordering / category compressing instead of alphabetical"):
+      `UI.lua`'s `OrderedSubcats` sorts by entry count descending (ties broken
+      alphabetically for a stable order), rather than pure alphabetical. Also
+      happens to pack better now that blocks are dynamically sized -- placing the
+      widest blocks first means the smaller ones that follow are the ones filling
+      whatever space is left in a row.
+
+## Bank split, transfer, deposit button
+- [x] ~~Warband/Personal empty-slot counts wrongly combined~~ — resolved
+      2026-08-17, user report: `Bank.lua`'s single merged `ns.BankModel` (one
+      `Scan` over both banks' bag IDs) meant "N empty slots" silently added
+      warband space (shared across every character on the account) to
+      personal space (not accessible to any of them) into one misleading
+      number. Fixed by splitting into two real, independent models
+      (`ns.PersonalBankModel`/`ns.WarbandBankModel`, both still
+      `ns.NewModel(getBagIDs)` instances -- no change needed to Data.lua's
+      generic `Scan`/`NewModel` at all) rather than teaching `Scan` a second
+      grouping axis it never needed before.
+- [x] ~~Bank view merging Personal/Warband into one set of sections~~ —
+      resolved 2026-08-17, same user report, same fix: `UI.lua`'s
+      `NewBagView` now renders one or more `opts.groups`, each with its own
+      complete section/subcategory breakdown and its own super-header
+      ("Warband Bank" / "Personal Bank") -- the bag view has exactly one,
+      unlabeled group (no behavior change there). Every pooled widget key
+      is namespaced by `groupKey` so two groups' same-named sections (both
+      banks have an "Equipment" section) get separate widgets.
+- [x] ~~Right-click category/subcategory to transfer items~~ — resolved
+      2026-08-17, user request ("categories *and* subcategories should be
+      right clickable to transfer all of the items from that category"):
+      new `Transfer.lua`'s `ns.TransferEntries(entries, targetBagIDs)` does
+      the actual move -- `C_Container.PickupContainerItem` pickup-then-place
+      pairs, verified safe against Baganator's own real, shipped
+      `Transfers/FromBagsToBags.lua` (same pair, `PickupContainerItem` is
+      NOT itself protected, only `UseContainerItem` is -- see DESIGN.md).
+      Section headers (`AcquireHeaderButton`) now register both
+      `LeftButtonUp`/`RightButtonUp`: left toggles collapse (unchanged),
+      right transfers every entry in that section. Subcategory labels
+      switched from a bare `FontString` (`AcquireLabel`) to a real `Button`
+      (`AcquireSubcatLabelButton`), since a FontString can't receive
+      clicks at all -- right-click transfers just that block's entries.
+      Direction is always "the other view": bag view's groups target
+      `ns.GetWarbandBankBagIDs` (default bank, matching the existing
+      "warband bank listed first" precedent -- only actually succeeds
+      while at a banker, a real Blizzard restriction, not enforced by this
+      addon itself), both bank groups target `ns.BAG_IDS`. Guarded on
+      `InCombatLockdown()`, matching Baganator's own transfer code.
+      Untested against a live client -- the riskiest untested piece of this
+      whole pass, given it's the one that actually moves items.
+- [x] ~~"Deposit Reagents" button lost when the default bank frame was
+      suppressed~~ — resolved 2026-08-17, user request: `Bank.lua`'s
+      `ns.DepositReagents()` calls the modern equivalent,
+      `C_Bank.AutoDepositItemsIntoBank(bankType)`, against both bank types
+      (whichever one actually has a reagent-flagged tab configured; each
+      call is a no-op on the other) -- the old standalone Reagent Bank
+      button doesn't exist anymore now that it's folded into regular tabs.
+      Rendered as a real `UIPanelButtonTemplate` button, bottom-left of the
+      bank frame (mirroring the currency row's bottom-right), bank-view-only
+      (`opts.depositButton`).
+- [x] ~~Bank currency row showing currencies a bank can't hold~~ — resolved
+      2026-08-17, user's own reasoning ("the bank should not have
+      currencies other than what the warband or personal bank has
+      independently, the banks can not store other types of currencies"):
+      the bank view's currency row (`opts.currencyMode = "warbandGoldOnly"`)
+      now shows only Warband Bank's own deposited-gold balance
+      (`Bank.lua`'s `ns.GetWarbandBankGold`, `C_Bank.FetchDepositedMoney`) --
+      a real, separate pool from the player's own `GetMoney()`. Personal
+      bank gets nothing shown (it has no currency store of its own -- it's
+      just character gold, already on the bag view's row), and none of
+      `Currency.lua`'s pinned currencies (Artisan's Mettle, Delve
+      currencies) render here at all, since they're not bank content.
+      Refreshed on a new `ACCOUNT_MONEY` event (`SpeedyBags.lua`) -- separate
+      from `PLAYER_MONEY`, which only covers the character's own gold.
+
+## Masonry layout
+- [x] ~~Row-then-wrap left small categories stranded on a mostly-empty new
+      row~~ — resolved 2026-08-17, user report with a diagram (a full row of
+      small Crafting subcategories -- Enchanting, Finishing Reagents, Parts,
+      Cooking, Optional Reagents -- would have fit in the leftover space
+      below a shorter column from the row above, instead of forcing an
+      entire new row): `UI.lua`'s `RenderSection` replaced left-to-right
+      row-wrapping with real masonry -- `SECTION_COLUMNS` (5) fixed-position
+      column slots, each with its own running height; every subcategory
+      block (still densest-first via `OrderedSubcats`) goes into whichever
+      column currently has the least content, not the next slot in reading
+      order. Column x-positions are fixed-width (`SUBCAT_WIDTH`); a
+      narrower block (`SubcatCols`) still only takes its own width within
+      that slot, left-aligned -- the "5 columns" stayed, only the packing
+      itself changed. Deliberately NOT also implemented: the user's
+      follow-on idea of precomputing Warband's layout once globally and
+      each character's once per-character, only reflowing on window close
+      instead of live on every model update -- that's a real, separate
+      architectural question (this project's own still-open task 3: what
+      triggers a re-render, at what granularity) rather than something the
+      packing algorithm itself needs, and masonry recompute at these bag
+      sizes (a few hundred items at most) hasn't been shown to actually
+      cost anything yet. Untested against a live client.
+- [x] ~~"Deposit Reagents" target unclear~~ — resolved 2026-08-17, user
+      question ("which bank does the 'deposit reagents' button deposit them
+      to?"): the honest answer is genuinely both (whichever bank type
+      actually has a reagent-flagged tab picks the items up, the other call
+      is a no-op) -- added a tooltip to the button saying so outright
+      instead of leaving it ambiguous, rather than trying to guess/restrict
+      to one bank type.
+
+## Real bank tabs, snappy-open, deposit-target fix
+- [x] ~~Stacked Personal/Warband groups weren't real tabs~~ — resolved
+      2026-08-17, user correction ("this is why i wanted personal bank and
+      warband bank as separate tabs" / "I want them to go to the bank that
+      is selected"): `UI.lua`'s `NewBagView` now shows exactly one group at
+      a time behind real switchable tab buttons (bottom of the frame, above
+      the currency/deposit row -- user's own placement preference,
+      "traditionally below the frame ... below even the currency frame"),
+      not both banks' content stacked simultaneously. Selection persists per
+      view via `SpeedyBagsDB.selectedGroup`. This also resolved the
+      Deposit Reagents ambiguity for free: the button now targets
+      `SelectedGroup().bankType` specifically (`Bank.lua`'s
+      `ns.DepositReagents(bankType)`, no longer tries both banks
+      unconditionally) since the user has a reagent-flagged tab on both
+      banks, making "whichever one has it" a genuinely ambiguous answer,
+      not just an apparently ambiguous one.
+- [x] ~~Opening the window forced a full re-scan every time~~ — resolved
+      2026-08-17, user correction: this addon's own founding complaint
+      (`DESIGN.md`'s Purpose section) is that every other bag addon is slow
+      to open; forcing `model.Update()` (a full container/quest/item
+      re-scan) on every single `view.Show()` reproduced exactly that. Fixed
+      by decoupling the *scan* from window visibility entirely
+      (`SpeedyBags.lua`'s `MakeScheduler` no longer gates on
+      `frame:IsShown()`) so it runs continuously in the background,
+      spread across the many individual `BAG_UPDATE`-family events that
+      already fire during normal play/login, the same way `Currency.lua`
+      already always has -- by the time the player opens the window,
+      `model.entries` is already current, so `Show()` only pays for one
+      render pass (`Refresh()`), not a scan AND a render. The deeper
+      version of this -- `Refresh()`'s own masonry/layout pass still runs
+      as one synchronous call, not diffed or spread across frames, which
+      matters because WoW's client is single-threaded and synchronous Lua
+      work sits directly in the render-thread path -- is DESIGN.md's own
+      already-stated target architecture ("Render layer: subscribes to
+      data-layer diffs, patches only affected slots") and remains
+      genuinely gated on the task-3 investigation this project has never
+      done. Not "no evidence it's slow" (a framing this file briefly used
+      and the user corrected) -- the real reason is architectural
+      (never block the render thread by default), not a measured cost.
+
+## Live in-game testing fixes
+- [x] ~~Both bank tabs showed empty on first open~~ — resolved 2026-08-17,
+      user report while testing live: the scan/render decoupling above
+      wrongly assumed background events pre-warm every model the way
+      `BAG_UPDATE` always does for bags -- but bank contents genuinely
+      aren't available before `BANKFRAME_OPENED` fires (no equivalent
+      event exists to pre-warm bank data from elsewhere in the world).
+      `SpeedyBags.lua`'s `BANKFRAME_OPENED` handler now explicitly calls
+      both bank models' `Update()` before `ns.BankView.Show()` -- once per
+      actual bank visit, not once per SpeedyBags-window toggle, so this
+      isn't a regression back to the "recompute on every open" cost that
+      fix was for.
+- [x] ~~Tabs/Deposit Reagents/currency on separate rows~~ — resolved
+      2026-08-17, user request ("put the buttons on the same row as the
+      currency"): all three now share the bottom row -- tabs left-anchored,
+      Deposit Reagents right after them, currency display right-anchored
+      as before. Confirmed there's real room (tabs+button ~430px, currency
+      ~170px, against an ~880px-wide frame).
 
 ## Category headers
 - [x] ~~Collapsible section headers~~ — resolved 2026-08-17: section headers

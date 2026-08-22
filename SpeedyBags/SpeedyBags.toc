@@ -2,7 +2,7 @@
 ## Title: SpeedyBags
 ## Notes: Bag/bank addon with a real controller nav order and non-blocking updates.
 ## Author: Luna Niemitalo
-## Version: 0.5.0-mvp-bank-currency
+## Version: 0.6.0-mvp-bank-split
 ## SavedVariables: SpeedyBagsDB
 ## OptionalDeps: Leatrix_Plus, Pawn
 ## X-License: (unset)
@@ -25,5 +25,6 @@ Pawn.lua
 Currency.lua
 Data.lua
 Bank.lua
+Transfer.lua
 UI.lua
 SpeedyBags.lua
