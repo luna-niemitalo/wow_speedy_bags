@@ -2,7 +2,7 @@
   description = "SpeedyBags — WoW bag addon dev environment";
 
   inputs = {
-    pins.url = "path:/home/luna/nix/pins";
+    pins.url = "path:/etc/nixos/pins";
     nixpkgs.follows = "pins/nixpkgs";
   };
 
