@@ -49,6 +49,34 @@ work above.
   scheduler), so by inspection this *should* already self-correct — but that's
   exactly what was true of the transfer-ghosting bug too before it was traced to a
   real gap. Needs its own live-client look, not assumed fixed by inspection.
+      Superseded by the design below, which covers this case too (the ~5s background
+      reconciliation pass doesn't care whether a move went through `Transfer.lua` or
+      plain drag-and-drop).
+- [x] **Multi-item transfers still "often" leave ghosts** — implemented
+      2026-09-12, untested in-game. (`DESIGN.md`'s "Transfer
+      verification" section, `TASKS.md` task 10) — the existing single trailing
+      `RescanAllModels()` isn't enough for a batch where different items settle at
+      different times. Design: a fast (~300ms) per-item verification loop, keyed by
+      item identity (GUID for equipment; itemID + before/after count-delta for
+      stackables — see task 10 for why stackables can't always use a bare GUID),
+      registered for every pickup/place pair `Transfer.lua`'s `StepQueue` executes.
+      Classifies each pending item every tick as: found in target (done), found in
+      source only (retry the specific item, capped at 2-3 attempts), found in
+      neither (force a real model rescan, then re-check — genuinely stuck if still
+      missing), or found in both (force a rescan — almost always resolves to "target
+      only," the textbook ghost). Separately, an always-on ~5s background
+      `model.Update()` ticker (independent of `BAG_UPDATE`-family events) catches
+      drift from any missed event, including the plain-drag-and-drop case above that
+      has no verification today at all. **Correction**: those two mechanisms alone
+      only prove the data layer (`model.entries`) matches real game state — they
+      don't prove the render layer (actually-visible widgets) matches the data
+      layer, which is what a ghost actually is. Third piece: every forced
+      `model.Update()` from either mechanism also forces that view's `Refresh()`
+      directly (not just the existing debounced `ScheduleRefresh`), and `Refresh()`
+      itself gets a standing self-check — every render, not just during active
+      verification — asserting the shown-widget set matches `usedKeys`, printing
+      and correcting any mismatch. Not yet implemented; recommend a new
+      `SpeedyBags/Verify.lua` rather than growing `Transfer.lua` further.
 - **Masonry recomputes on every item change and it's "*massively*" slow.** Partially
   addressed 2026-08-17: `UI.lua`'s `NewBagView` now debounces `Refresh()` itself
   (`ScheduleRefresh`, a `C_Timer.NewTimer(0.1, ...)` that cancels and reschedules on
@@ -62,6 +90,80 @@ work above.
   investigation, not something this pass rebuilt. Whether 0.1s trailing-debounce
   actually reads as responsive rather than laggy is itself untested against a live
   client — first thing to tune if the window feels sluggish to update while open.
+
+## Live testing findings, 2026-09-12
+
+Reported directly by the user, plus one item raised by the user's own examples
+(profession Knowledge/Glimmer/Flicker items). Investigation and design recorded in
+`DESIGN.md` invariants 5 (correction)/6 (new) and `TASKS.md` tasks 1 (addendum)/7
+(new) — this section is just the resulting action items.
+
+- [x] **ConsolePort cursor never enters the SpeedyBags frame at all** — implemented
+      2026-09-12, untested in-game. (`TASKS.md`
+      task 1's addendum) — confirmed by investigation: ConsolePortNode's geometric
+      scan only ever runs on frames in ConsolePort's own curated `Stack` registry,
+      and `SpeedyBagsFrame`/`SpeedyBagsBankFrame` are in none of the fixed lists
+      that populate it. Fix: `ConsolePort:AddInterfaceCursorFrame(frame)`,
+      existence-guarded, once per view at creation in `UI.lua`'s `NewBagView`. Every
+      `nodeignore`/`nodepriority` tag already in place is correct and becomes
+      effective the moment this call is added — no other change needed for this one.
+- [x] **Masonry layout reflows while the bag is open** — implemented 2026-09-12,
+      untested in-game; see also the first-session-ever-open consequence flagged in
+      the chat: with no reservation table yet, everything starts in New Items until
+      a close or manual Sort. (`DESIGN.md` invariant 6,
+      `TASKS.md` task 7) — `RenderSection`'s masonry pack, `OrderedSubcats`'
+      live-count sort, and `SubcatCols`' live-count width all recompute from
+      current entry counts on every render, so picking up/using/vendoring a single
+      item can move subcategories and items that had nothing to do with that
+      change. Design resolved (user-directed, `TASKS.md` task 7): a
+      reservation table written only by an explicit sort pass, triggered at view
+      **close** time (not on the next open — sorting on open would delay opening
+      the window) or by a new manual "Sort" button while open. New/unreserved
+      items land in a repurposed New Items staging area instead of their category
+      until the next sort — including items that first appear while the view is
+      closed, which correctly wait for the *next* close rather than being
+      pre-sorted before the following open. Reacquiring an item that still holds
+      a reservation (even at zero count) falls straight back into its old slot;
+      the sort itself is weighted to keep large/dense subcategories (Crafting
+      materials, etc.) more resistant to moving than small ones. Multi-file
+      rewrite (`UI.lua`'s render/sort split plus a `Hide()` hook, `Data.lua`'s
+      `NewRecentTracker` losing its timer-driven expiry) — not yet implemented.
+- [ ] **Verify same-itemID merging actually holds for known non-equipment edge
+      cases** — no code change expected here (Data.lua's `byItemID` merge already
+      keys purely on itemID for anything not classID Weapon/Armor, fixed
+      2026-08-16 per this file's own "Artisan bags... not merging" entry above),
+      but this was never confirmed live and the user named specific items to check:
+      Crafting Order reward bags, each profession's Knowledge parchments (e.g.
+      "Glimmer of Midnight <Profession> Knowledge" / "Flicker of Midnight
+      <Profession> Knowledge" — each profession's own item stays its own separate
+      stack, by design, since each is a distinct itemID; only exact duplicates of
+      the *same* item should ever merge), and
+      [Artisan's Consortium Payout](https://www.wowhead.com/item=246585/artisans-consortium-payout)
+      specifically. If any of these still show as separate stacks in-game despite
+      sharing an itemID, the likely culprits to check first are `Junk.lua`'s
+      `IsJunk` (wrongly flagging one as vendor trash, which pulls it out of the
+      entry list entirely instead of merging it) and `C_Container.GetContainerItemQuestInfo`
+      (wrongly flagging one as a quest item, same effect) — not the merge logic
+      itself, which doesn't special-case any of these items.
+
+- [x] **Blizzard's default bag UI still opens in some situations (Item Upgrade
+      view named specifically) and can't be closed without `/reload`**
+      (`DESIGN.md`'s "Default-UI suppression must be structural" section,
+      `TASKS.md` task 8) — confirmed root cause: `Blizzard_ItemUpgradeUI` opens
+      bags via `OpenAllBagsMatchingContext` → raw `OpenBag(i)`, bypassing every
+      global `SpeedyBags.lua` redefines; closing (both its own close and Escape)
+      routes back through our redefined `CloseAllBags`, which only ever hides
+      our own frame, leaving Blizzard's real one stuck open with nothing able to
+      hide it. Fix: `HideDefaultBags()` in `SpeedyBags.lua`, structurally
+      identical to `Bank.lua`'s existing `HideDefaultBank()` (reparent
+      `ContainerFrame1..6`/`ContainerFrameCombinedBags` onto a hidden frame,
+      clear their show/hide/event scripts — 1-6, matching Baganator's own real
+      cited range, not 1-13 as this bullet originally guessed) — same proven
+      technique Baganator and BetterBags both actually ship. Also register
+      `SpeedyBagsFrame`/`SpeedyBagsBankFrame` into `UISpecialFrames` so Escape
+      closes our own frames directly (separate, related gap — neither was
+      registered anywhere for Escape-to-close before). **Implemented
+      2026-09-12**, untested in-game.
 
 ## Known gaps
 - [x] ~~In-combat item use/pickup~~ — resolved: slot buttons inherit Blizzard's real

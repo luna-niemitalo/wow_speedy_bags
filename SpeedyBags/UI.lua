@@ -69,6 +69,12 @@ local SECTION_COLUMNS = 5
 local CONTENT_WIDTH = SECTION_COLUMNS * SUBCAT_WIDTH + (SECTION_COLUMNS - 1) * SUBCAT_PAD_X
 local FRAME_WIDTH = MARGIN * 2 + SCROLLBAR_WIDTH + CONTENT_WIDTH
 
+-- New Items is the one area DESIGN.md invariant 6 explicitly exempts from
+-- "no reflow while open" -- a bounded staging grid for entries with no
+-- layout reservation yet (see Sort()/GroupEntries), wrapping to as many rows
+-- as it needs within the content width rather than a fixed single row.
+local NEW_ITEMS_COLS = math.max(1, math.floor(CONTENT_WIDTH / (SLOT_SIZE + SLOT_PAD)))
+
 -- Caps the outer window's height so it can never grow off-screen (the
 -- bank view routinely has enough tabs/items to hit this) -- content
 -- beyond it scrolls instead, per the user's own report of the bank view
@@ -128,10 +134,10 @@ end
 -- default bag view, hovering items there -- ContainerFrameItemButtonMixin:
 -- OnUpdate does this on hover, ContainerFrame.lua:1541) -- so every item
 -- would show the glow at once instead of just genuinely-new ones. This is
--- also why the Recent row (Data.lua's NewRecentTracker) keeps its own
--- separate notion of "recently seen" rather than reading C_NewItems back
--- out here: RemoveNewItem below erases that signal on every single render,
--- before anything else could ever read it.
+-- also why New Items (an entry with no layout reservation yet, see Sort()/
+-- GroupEntries -- no longer a count-diffing heuristic the way it used to
+-- be) can't be based on C_NewItems either: RemoveNewItem below erases that
+-- signal on every single render, before anything else could ever read it.
 local function ClearNewItemGlow(btn, bagID, slot)
 	C_NewItems.RemoveNewItem(bagID, slot)
 	btn.NewItemTexture:Hide()
@@ -216,52 +222,46 @@ local function SetQuestVisual(btn, questItems)
 	end)
 end
 
--- Groups Model entries into { [section] = { [subcategory] = {entries} } },
--- per Categories.lua's classification. Pure data reshaping, no widgets.
-local function GroupEntries(model)
+-- Splits model.entries into (a) entries that already have a layout
+-- reservation (state.itemSlotIndex[entry.key] set by a past Sort(), below) --
+-- grouped section -> subcategory -> {entries} for RenderSection to lay out
+-- at their frozen positions -- and (b) entries with no reservation yet, the
+-- "New Items" staging list (DESIGN.md invariant 6 / TASKS.md task 7). Pure
+-- data reshaping, no widgets, and critically: READ-ONLY against state --
+-- only Sort() ever writes a reservation. An item that's temporarily at zero
+-- count (used up, not yet reacquired) simply isn't in model.entries at all
+-- this scan, so it isn't in either list either -- its reservation, if any,
+-- just sits there unfilled until it reappears.
+local function GroupEntries(model, state)
 	local sections = {}
+	local newItems = {}
 	for _, entry in ipairs(model.entries) do
-		local bySubcat = sections[entry.section]
-		if not bySubcat then
-			bySubcat = {}
-			sections[entry.section] = bySubcat
+		if state.itemSlotIndex[entry.key] then
+			local bySubcat = sections[entry.section]
+			if not bySubcat then
+				bySubcat = {}
+				sections[entry.section] = bySubcat
+			end
+			local list = bySubcat[entry.subcategory]
+			if not list then
+				list = {}
+				bySubcat[entry.subcategory] = list
+			end
+			table.insert(list, entry)
+		else
+			table.insert(newItems, entry)
 		end
-		local list = bySubcat[entry.subcategory]
-		if not list then
-			list = {}
-			bySubcat[entry.subcategory] = list
-		end
-		table.insert(list, entry)
 	end
-	return sections
-end
-
--- Denser subcategories first (ties broken alphabetically, for a stable
--- order run to run), rather than pure alphabetical -- per the user's
--- "reasonable ordering / category compressing instead of alphabetical"
--- request. This also happens to pack better once blocks are dynamically
--- sized (RenderSection/SubcatCols below): placing the widest blocks first
--- means the smaller ones that follow are the ones filling whatever's left
--- in a row, rather than a wide block landing last and forcing an
--- otherwise-avoidable wrap.
-local function OrderedSubcats(bySubcat)
-	local keys = {}
-	for k in pairs(bySubcat) do
-		table.insert(keys, k)
-	end
-	table.sort(keys, function(a, b)
-		local countA, countB = #bySubcat[a], #bySubcat[b]
-		if countA ~= countB then
-			return countA > countB
-		end
-		return a < b
-	end)
-	return keys
+	return sections, newItems
 end
 
 -- All entries in a section, regardless of subcategory -- what a section
 -- header's right-click transfer (AcquireHeaderButton) needs to move, since
--- it's scoped to the whole section, not one subcategory block.
+-- it's scoped to the whole section, not one subcategory block. Only ever
+-- sees currently-reserved, currently-present entries (GroupEntries above) --
+-- an unsorted New Item isn't part of any section's rendered grid yet, so a
+-- section transfer can't reach it either; it becomes transferable normally
+-- once a sort gives it a real position.
 local function FlattenEntries(bySubcat)
 	local all = {}
 	for _, entries in pairs(bySubcat) do
@@ -272,13 +272,242 @@ local function FlattenEntries(bySubcat)
 	return all
 end
 
--- A block with fewer entries than SUBCAT_COLS only needs that many
--- columns -- e.g. a lone Optional Reagent or a five-item Parts stack no
--- longer reserves a full SUBCAT_COLS-wide block's worth of empty space.
--- Derived straight from the entry count, not configured per subcategory,
--- per the user's own "we need to dynamically detect that" framing.
-local function SubcatCols(entries)
-	return math.max(1, math.min(SUBCAT_COLS, #entries))
+-- A block with fewer reserved slots than SUBCAT_COLS only needs that many
+-- columns -- e.g. a lone Optional Reagent or a five-item Parts stack doesn't
+-- reserve a full SUBCAT_COLS-wide block's worth of empty space. Takes a
+-- slot COUNT now, not an entries list -- Sort() (below) is the only caller,
+-- and it only ever knows "how many slots this subcategory has ever held"
+-- (state.subcatNextIndex), not a live entries list, since slots are never
+-- freed once reserved.
+local function SubcatCols(slotCount)
+	return math.max(1, math.min(SUBCAT_COLS, slotCount))
+end
+
+---------------------------------------------------------------
+-- Layout reservation (DESIGN.md invariant 6, TASKS.md task 7)
+---------------------------------------------------------------
+-- Sort() is the ONLY function in this file that ever writes a layout
+-- position -- every render below is a pure read against whatever it left
+-- behind. Called at exactly two points (see NewBagView's Hide()/Sort
+-- button): the view being closed, and a manual "Sort" click while it's
+-- still open. Never from an OnChanged listener, a timer, or any other event
+-- -- that's the whole point of the invariant.
+--
+-- state (one per groupKey, see NewBagView's GetSortState): {
+--   itemSlotIndex  = { [entry.key] = index },        -- 0-based, valid only
+--                                                        until the next Sort()
+--                                                        recompacts its subcategory
+--   keySubcat      = { [entry.key] = subcatKey },     -- reverse lookup, Sort()'s own
+--                                                        bookkeeping -- see below
+--   subcatColumn   = { [subcatKey] = column },
+--   subcatNextIndex = { [subcatKey] = count },        -- this subcategory's current
+--                                                         reserved slot count
+--   subcatCols     = { [subcatKey] = cols },          -- SubcatCols(subcatNextIndex)
+--   subcatSection  = { [subcatKey] = sectionName },   -- for per-section column math
+--   columnOrder    = { [sectionName] = { [column] = { subcatName, ... } } }, -- render order
+-- }
+-- subcatKey is "sectionName:subcategoryName" (global uniqueness); columnOrder's
+-- innermost lists hold the bare subcategoryName, since they're already
+-- scoped per section.
+--
+-- Compacts as of 2026-09-12 (user question: does a dead reservation -- an
+-- item no longer owned -- ever get reclaimed, or does it sit there for the
+-- rest of the session?). It didn't; now it does, at every Sort() call,
+-- which is one of only two things that ever call this (view close, or the
+-- manual Sort button) -- both already-allowed reflow points, so compacting
+-- there doesn't touch invariant 6 at all. This does mean the "item falls
+-- back into its old slot on reacquire" stickiness (DESIGN.md invariant 6)
+-- is a promise for ONE open session (between two sorts), not forever: a
+-- sort is explicitly a fresh reconciliation against whatever's actually
+-- owned right now, not just an append pass.
+local function Sort(state, model)
+	state.keySubcat = state.keySubcat or {}
+
+	-- Every CURRENTLY present entry, grouped by subcategory -- unlike an
+	-- append-only design, this recomputes membership for every touched
+	-- subcategory each call, which is what lets a subcategory shrink back
+	-- down when items in it are gone, not just grow forever.
+	local bySubcat = {}
+	local subcatSection = {}
+	for _, entry in ipairs(model.entries) do
+		local subcatKey = entry.section..":"..entry.subcategory
+		local list = bySubcat[subcatKey]
+		if not list then
+			list = {}
+			bySubcat[subcatKey] = list
+			subcatSection[subcatKey] = entry.section
+		end
+		table.insert(list, entry)
+	end
+
+	-- Drop any subcategory that used to have a reservation but is now
+	-- completely empty -- it stops reserving a header/column slot at all;
+	-- clearing its members' keySubcat/itemSlotIndex too, so if any of them
+	-- individually reappear later they're treated as genuinely new rather
+	-- than falling back into a block that no longer exists.
+	for subcatKey in pairs(state.subcatColumn) do
+		if not bySubcat[subcatKey] then
+			local sectionName = state.subcatSection[subcatKey]
+			local col = state.subcatColumn[subcatKey]
+			local subcatName = subcatKey:match(":(.+)$")
+			local list = state.columnOrder[sectionName] and state.columnOrder[sectionName][col]
+			if list then
+				for i, name in ipairs(list) do
+					if name == subcatName then
+						table.remove(list, i)
+						break
+					end
+				end
+			end
+			for key, owner in pairs(state.keySubcat) do
+				if owner == subcatKey then
+					state.itemSlotIndex[key] = nil
+					state.keySubcat[key] = nil
+				end
+			end
+			state.subcatColumn[subcatKey] = nil
+			state.subcatNextIndex[subcatKey] = nil
+			state.subcatCols[subcatKey] = nil
+			state.subcatSection[subcatKey] = nil
+		end
+	end
+
+	if not next(bySubcat) then
+		return -- nothing currently present anywhere -- nothing to place
+	end
+
+	-- One masonry pass per section -- columns are a per-section grid
+	-- (RenderSection stacks sections vertically, each with its own
+	-- SECTION_COLUMNS column set), not one grid spanning the whole view.
+	local bySection = {}
+	for subcatKey, entries in pairs(bySubcat) do
+		local sectionName = subcatSection[subcatKey]
+		local list = bySection[sectionName]
+		if not list then
+			list = {}
+			bySection[sectionName] = list
+		end
+		list[subcatKey] = entries
+	end
+
+	for sectionName, sectionSubcats in pairs(bySection) do
+		-- Every subcategory touched this pass gets a freshly computed
+		-- width/height BEFORE column decisions -- column choice below needs
+		-- to know each one's resulting row count to weigh "worth moving."
+		local rowsOf, colsOf = {}, {}
+		for subcatKey, entries in pairs(sectionSubcats) do
+			colsOf[subcatKey] = SubcatCols(#entries)
+			rowsOf[subcatKey] = math.ceil(#entries / colsOf[subcatKey])
+		end
+
+		-- Running per-column row totals -- seeded from every OTHER
+		-- subcategory in this section not touched this pass (nothing to
+		-- recompute for those; they keep whatever they already had).
+		local columnRows = {}
+		for col = 1, SECTION_COLUMNS do
+			columnRows[col] = 0
+		end
+		for subcatKey, col in pairs(state.subcatColumn) do
+			if state.subcatSection[subcatKey] == sectionName and not sectionSubcats[subcatKey] then
+				columnRows[col] = columnRows[col]
+					+ math.ceil(state.subcatNextIndex[subcatKey] / state.subcatCols[subcatKey])
+			end
+		end
+
+		-- Largest-first: a big/dense subcategory gets first pick of (or
+		-- first claim to keep) the best column -- "larger categories more
+		-- resistant to being moved" (user request, 2026-09-12).
+		local order = {}
+		for subcatKey in pairs(sectionSubcats) do
+			table.insert(order, subcatKey)
+		end
+		table.sort(order, function(a, b) return #sectionSubcats[a] > #sectionSubcats[b] end)
+
+		for _, subcatKey in ipairs(order) do
+			local entries = sectionSubcats[subcatKey]
+			local rows = rowsOf[subcatKey]
+			local prevCol = state.subcatColumn[subcatKey]
+
+			local shortestCol = 1
+			for col = 2, SECTION_COLUMNS do
+				if columnRows[col] < columnRows[shortestCol] then
+					shortestCol = col
+				end
+			end
+
+			local targetCol
+			if prevCol and (columnRows[prevCol] - columnRows[shortestCol]) <= rows then
+				-- Keep its existing column: the imbalance moving would fix
+				-- is smaller than this subcategory's OWN size -- not worth
+				-- it, and the bigger the subcategory, the higher that bar
+				-- is, exactly the "more resistant to being moved" request.
+				targetCol = prevCol
+			else
+				targetCol = shortestCol
+				if prevCol and prevCol ~= targetCol then
+					local subcatName = subcatKey:match(":(.+)$")
+					local oldList = state.columnOrder[sectionName] and state.columnOrder[sectionName][prevCol]
+					if oldList then
+						for i, name in ipairs(oldList) do
+							if name == subcatName then
+								table.remove(oldList, i)
+								break
+							end
+						end
+					end
+				end
+			end
+
+			-- Clear stale reservations for this subcategory: any key
+			-- previously tracked here that isn't among its currently-
+			-- present entries. Without this, an item that left before this
+			-- compaction could later reappear and collide with (or render
+			-- outside the bounds of) a freshly compacted, smaller block.
+			local currentKeys = {}
+			for _, entry in ipairs(entries) do
+				currentKeys[entry.key] = true
+			end
+			for key, owner in pairs(state.keySubcat) do
+				if owner == subcatKey and not currentKeys[key] then
+					state.itemSlotIndex[key] = nil
+					state.keySubcat[key] = nil
+				end
+			end
+
+			state.subcatColumn[subcatKey] = targetCol
+			state.subcatCols[subcatKey] = colsOf[subcatKey]
+			state.subcatNextIndex[subcatKey] = #entries
+			state.subcatSection[subcatKey] = sectionName
+
+			if not prevCol or prevCol ~= targetCol then
+				state.columnOrder[sectionName] = state.columnOrder[sectionName] or {}
+				state.columnOrder[sectionName][targetCol] = state.columnOrder[sectionName][targetCol] or {}
+				table.insert(state.columnOrder[sectionName][targetCol], subcatKey:match(":(.+)$"))
+			end
+
+			for i, entry in ipairs(entries) do
+				state.itemSlotIndex[entry.key] = i - 1
+				state.keySubcat[entry.key] = subcatKey
+			end
+
+			columnRows[targetCol] = columnRows[targetCol] + rows
+		end
+	end
+
+	-- A section every one of whose subcategories just got dropped above
+	-- stops showing its header too, rather than lingering forever.
+	for sectionName, columns in pairs(state.columnOrder) do
+		local hasAny = false
+		for _, list in pairs(columns) do
+			if #list > 0 then
+				hasAny = true
+				break
+			end
+		end
+		if not hasAny then
+			state.columnOrder[sectionName] = nil
+		end
+	end
 end
 
 -- Builds one independent view: its own frame, its own pooled widgets. The
@@ -353,6 +582,20 @@ local function NewBagView(opts)
 	-- selection; its children (slots, the Junk slot, currency row) are
 	-- unaffected and still reachable.
 	frame:SetAttribute("nodeignore", true)
+
+	-- ConsolePort only ever scans frames in its own curated cursor-navigable
+	-- frame stack -- nodeignore/nodepriority above (and on this view's
+	-- children below) are moot until this frame is actually IN that stack.
+	-- Confirmed by reading ConsolePort_Cursor's real source (2026-09-12,
+	-- see TASKS.md task 1's addendum): there is no "any nearby mouse-enabled
+	-- frame" fallback, only a curated registry populated by a fixed set of
+	-- known frame-name lists plus this one public API call. Existence-guarded
+	-- like every other soft integration in this project (Junk.lua/Pawn.lua) --
+	-- safe even if ConsolePort, or its load-on-demand Cursor module, isn't
+	-- installed/loaded yet (the real API defers internally).
+	if ConsolePort and ConsolePort.AddInterfaceCursorFrame then
+		ConsolePort:AddInterfaceCursorFrame(frame)
+	end
 
 	local title = frame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
 	title:SetPoint("TOP", 0, -14)
@@ -475,13 +718,37 @@ local function NewBagView(opts)
 	-- switch just reuses the same widgets for whichever group is now
 	-- selected (Refresh sets fresh text/entries/points on them either way).
 	local slotPool = {}
-	local labelPool = {} -- aggregate-row labels (Recent/Empty/Junk/Quest), keyed by a string tag
+	local labelPool = {} -- aggregate-row labels (New Items/Empty/Junk/Quest), keyed by a string tag
 	local subcatLabelPool = {} -- subcategory label BUTTONS (right-click transfer), keyed like bgPool
 	local bgPool = {} -- subcategory group backgrounds, keyed the same way as their label
 	local aggregateWidgets = {} -- "empty" / "junk" / "quest" -> widget
 	local currencyPool = {} -- "gold" / "cur:<currencyTypesID>" / "warbandGold" / "personalGold" -> widget
 	local headerPool = {} -- "header:<sectionName>" -> collapsible header button
 	local nextSlotID = 0
+
+	-- Layout reservation state (DESIGN.md invariant 6, TASKS.md task 7), one
+	-- per group -- only Sort() (module-level, above) ever writes into one of
+	-- these; Refresh() only ever reads. Session-only (reset on /reload,
+	-- along with everything else in this closure): a view always sorts
+	-- fresh at Hide() regardless, so nothing needs the SavedVariables
+	-- boundary for this.
+	local sortStates = {}
+	local function GetSortState(groupKey)
+		local state = sortStates[groupKey]
+		if not state then
+			state = {
+				itemSlotIndex = {},
+				keySubcat = {},
+				subcatColumn = {},
+				subcatNextIndex = {},
+				subcatCols = {},
+				subcatSection = {},
+				columnOrder = {},
+			}
+			sortStates[groupKey] = state
+		end
+		return state
+	end
 
 	-- A subtle background per subcategory block (LUNA_NOTES.md), just enough
 	-- lighter than the frame's own backdrop that adjacent groups read as
@@ -548,7 +815,7 @@ local function NewBagView(opts)
 		return btn
 	end
 
-	-- Aggregate-row labels only now (Recent/Empty/Junk/Quest) -- subcategory
+	-- Aggregate-row labels only now (New Items/Empty/Junk/Quest) -- subcategory
 	-- labels moved to AcquireSubcatLabelButton below, since those need to be
 	-- real clickable Buttons (right-click transfer) and a bare FontString
 	-- can't receive clicks at all.
@@ -577,7 +844,7 @@ local function NewBagView(opts)
 		btn.Text:SetPoint("LEFT")
 		btn:RegisterForClicks("RightButtonUp")
 		btn:SetScript("OnClick", function(self)
-			ns.TransferEntries(self.transferEntries, self.transferTargetBagIDs())
+			ns.TransferEntries(self.transferEntries, self.transferTargetBagIDs(), self.transferSourceBagIDs())
 		end)
 		-- Same reasoning as the section header below: being clickable
 		-- makes this a valid geometric nav candidate otherwise (unlike a
@@ -620,7 +887,7 @@ local function NewBagView(opts)
 		btn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
 		btn:SetScript("OnClick", function(self, button)
 			if button == "RightButton" then
-				ns.TransferEntries(self.transferEntries, self.transferTargetBagIDs())
+				ns.TransferEntries(self.transferEntries, self.transferTargetBagIDs(), self.transferSourceBagIDs())
 				return
 			end
 			SpeedyBagsDB.collapsedSections[sectionName] = not SpeedyBagsDB.collapsedSections[sectionName]
@@ -836,7 +1103,7 @@ local function NewBagView(opts)
 		end
 	end
 
-	-- Shared by RenderSubcategory and RenderRecentRow -- both put a real
+	-- Shared by RenderSubcategory and RenderNewItemsArea -- both put a real
 	-- entry into a real item slot, they just differ in where. Positioning
 	-- (SetPoint/Show) stays the caller's job since the two lay out
 	-- differently (a grid vs. a single row).
@@ -858,18 +1125,24 @@ local function NewBagView(opts)
 		btn:UpdateQuestItem(entry.isQuestItem, entry.questID, entry.isActiveQuestItem)
 	end
 
-	-- Renders one subcategory block (background + label + its items, wrapping
-	-- within the block if there are more than cols) at (x, y). cols is
-	-- SubcatCols(entries) -- the caller's job, since RenderSection needs the
-	-- same number to decide whether this block fits the current row before
-	-- calling this at all. groupKey namespaces the pooled background/label
-	-- widgets (see NewBagView's header comment); transferTargetBagIDs is
-	-- handed to the subcategory label for its right-click transfer. Returns
-	-- the block's rendered width and height.
+	-- Renders one subcategory block (background + label + its items) at
+	-- (x, y). cols/totalSlots are frozen -- Sort() decided them, this only
+	-- reads them (DESIGN.md invariant 6 / TASKS.md task 7): totalSlots is
+	-- this subcategory's full reserved grid size (every slot it has EVER
+	-- held, never shrinks), presentByIndex maps whichever of those slots
+	-- currently hold a real item (index -> entry) -- an index with nothing
+	-- in presentByIndex just renders as reserved empty space, not a gap
+	-- something else slides into. groupKey namespaces the pooled
+	-- background/label widgets (see NewBagView's header comment);
+	-- transferTargetBagIDs/transferSourceBagIDs are handed to the
+	-- subcategory label for its right-click transfer (Verify.lua needs the
+	-- source list too, to know where to check "did it actually leave").
+	-- Returns the block's rendered width and height.
 	local function RenderSubcategory(
-		x, y, groupKey, sectionName, label, entries, cols, transferTargetBagIDs, usedKeys, usedSubcatLabels, usedBGs
+		x, y, groupKey, sectionName, label, presentByIndex, cols, totalSlots, currentEntries,
+		transferTargetBagIDs, transferSourceBagIDs, usedKeys, usedSubcatLabels, usedBGs
 	)
-		local rows = math.ceil(#entries / cols)
+		local rows = math.ceil(totalSlots / cols)
 		local width = cols * SLOT_SIZE + (cols - 1) * SLOT_PAD
 		local height = SUBCAT_LABEL_HEIGHT + rows * SLOT_SIZE + (rows - 1) * SLOT_PAD
 
@@ -887,15 +1160,16 @@ local function NewBagView(opts)
 		labelBtn:SetPoint("TOPLEFT", content, "TOPLEFT", x, y)
 		labelBtn:SetSize(width, SUBCAT_LABEL_HEIGHT)
 		labelBtn.Text:SetText(label)
-		labelBtn.transferEntries = entries
+		labelBtn.transferEntries = currentEntries
 		labelBtn.transferTargetBagIDs = transferTargetBagIDs
+		labelBtn.transferSourceBagIDs = transferSourceBagIDs
 		labelBtn:Show()
 		usedSubcatLabels[blockKey] = true
 
 		local itemY = y - SUBCAT_LABEL_HEIGHT
-		for i, entry in ipairs(entries) do
-			local col = (i - 1) % cols
-			local row = math.floor((i - 1) / cols)
+		for index, entry in pairs(presentByIndex) do
+			local col = index % cols
+			local row = math.floor(index / cols)
 			local btn = AcquireSlot(entry.key)
 			usedKeys[entry.key] = true
 
@@ -913,29 +1187,22 @@ local function NewBagView(opts)
 		return width, height
 	end
 
-	-- Renders one section (header + its subcategory blocks, masonry-packed
-	-- into SECTION_COLUMNS fixed-position column slots) starting at y.
-	-- Returns the y to continue at, unchanged if the section has nothing in
-	-- it -- empty sections don't reserve space or show a header. A
-	-- collapsed section still shows its header (so it can be expanded
+	-- Renders one section (header + its subcategory blocks) starting at y,
+	-- purely by reading state.columnOrder/subcatColumn/subcatCols/
+	-- subcatNextIndex -- never computing a masonry pack itself (that's
+	-- Sort()'s job, run only at the two allowed trigger points). Returns
+	-- the y to continue at, unchanged if this group has never had anything
+	-- sorted into this section at all -- a section with a reservation but
+	-- zero currently-present items still shows (reserved space stays
+	-- reserved), only a section truly never sorted into skips its header.
+	-- A collapsed section still shows its header (so it can be expanded
 	-- again) but reserves no further space for its contents.
-	--
-	-- Masonry, not row-then-wrap (replaced 2026-08-17 per the user's own
-	-- report + diagram): each subcategory block (already ordered
-	-- densest-first by OrderedSubcats) goes into whichever column slot
-	-- currently has the LEAST content, not the next slot in reading order.
-	-- That's what lets a short block that would've been stranded at the
-	-- start of a mostly-empty new row instead tuck in beside a short
-	-- column from higher up -- exactly the "whole row would fit into the
-	-- empty space below the columns above it" case the user pointed out.
-	-- Column x-positions are fixed (SECTION_COLUMNS slots of SUBCAT_WIDTH
-	-- each); a narrower block (SubcatCols) still only takes its own width
-	-- within that slot, left-aligned -- keeps the "5 columns" the user
-	-- asked to keep, while the packing itself is what actually changed.
 	local function RenderSection(
-		groupKey, sectionName, bySubcat, y, transferTargetBagIDs, usedKeys, usedSubcatLabels, usedBGs, usedHeaders
+		groupKey, sectionName, bySubcat, y, state,
+		transferTargetBagIDs, transferSourceBagIDs, usedKeys, usedSubcatLabels, usedBGs, usedHeaders
 	)
-		if not bySubcat or not next(bySubcat) then
+		local columns = state.columnOrder[sectionName]
+		if not columns then
 			return y
 		end
 
@@ -945,8 +1212,9 @@ local function NewBagView(opts)
 		header:SetWidth(CONTENT_WIDTH)
 		local collapsed = SpeedyBagsDB.collapsedSections[sectionName]
 		header.Text:SetText((collapsed and "> " or "v ")..(ns.SECTION_LABELS[sectionName] or sectionName))
-		header.transferEntries = FlattenEntries(bySubcat)
+		header.transferEntries = FlattenEntries(bySubcat or {})
 		header.transferTargetBagIDs = transferTargetBagIDs
+		header.transferSourceBagIDs = transferSourceBagIDs
 		header:Show()
 		usedHeaders[groupKey.."header:"..sectionName] = true
 		y = y - SECTION_HEADER_HEIGHT
@@ -960,30 +1228,32 @@ local function NewBagView(opts)
 			columnBottom[col] = y
 		end
 
-		for _, subcatName in ipairs(OrderedSubcats(bySubcat)) do
-			local entries = bySubcat[subcatName]
-			local cols = SubcatCols(entries)
+		for col = 1, SECTION_COLUMNS do
+			for _, subcatName in ipairs(columns[col] or {}) do
+				local subcatKey = sectionName..":"..subcatName
+				local cols = state.subcatCols[subcatKey]
+				local totalSlots = state.subcatNextIndex[subcatKey]
+				local currentEntries = (bySubcat and bySubcat[subcatName]) or {}
 
-			local shortestCol = 1
-			for col = 2, SECTION_COLUMNS do
-				if columnBottom[col] > columnBottom[shortestCol] then
-					shortestCol = col
+				local presentByIndex = {}
+				for _, entry in ipairs(currentEntries) do
+					presentByIndex[state.itemSlotIndex[entry.key]] = entry
 				end
-			end
 
-			local blockY = columnBottom[shortestCol]
-			if blockY < y then
-				-- Not the first block in this column -- leave a gap below
-				-- whatever's already stacked there.
-				blockY = blockY - SUBCAT_PAD_Y
-			end
-			local blockX = (shortestCol - 1) * (SUBCAT_WIDTH + SUBCAT_PAD_X)
+				local blockY = columnBottom[col]
+				if blockY < y then
+					-- Not the first block in this column -- leave a gap
+					-- below whatever's already stacked there.
+					blockY = blockY - SUBCAT_PAD_Y
+				end
+				local blockX = (col - 1) * (SUBCAT_WIDTH + SUBCAT_PAD_X)
 
-			local _, height = RenderSubcategory(
-				blockX, blockY, groupKey, sectionName, subcatName, entries, cols,
-				transferTargetBagIDs, usedKeys, usedSubcatLabels, usedBGs
-			)
-			columnBottom[shortestCol] = blockY - height
+				local _, height = RenderSubcategory(
+					blockX, blockY, groupKey, sectionName, subcatName, presentByIndex, cols, totalSlots,
+					currentEntries, transferTargetBagIDs, transferSourceBagIDs, usedKeys, usedSubcatLabels, usedBGs
+				)
+				columnBottom[col] = blockY - height
+			end
 		end
 
 		local sectionBottom = y
@@ -993,51 +1263,69 @@ local function NewBagView(opts)
 		return sectionBottom - SECTION_PAD_Y
 	end
 
-	-- Recent, Empty, and Junk aggregate widgets share one row, positioned
-	-- between Equipment and Misc to match the user's existing Baganator
-	-- layout, which puts its Recent/Empty row there deliberately for
-	-- ConsolePort nav reasons -- worth revisiting once our own nav-graph
+	-- New Items: every entry GroupEntries found with no layout reservation
+	-- yet (DESIGN.md invariant 6 / TASKS.md task 7) -- rendered as real,
+	-- individually-clickable item slots (AcquireSlot), not the aggregate-
+	-- badge shape Junk/Quest use, since these are actionable items, not a
+	-- collapsed count. Wraps across as many rows as it needs (NEW_ITEMS_COLS
+	-- per row) rather than a fixed single row -- this is the one area
+	-- allowed to reflow on its own, per invariant 6's exception, since it's
+	-- a bounded staging area rather than a semantic category. Keyed
+	-- "new:"..entry.key rather than entry.key itself: an item here never
+	-- ALSO renders in a category grid at the same time (GroupEntries splits
+	-- reserved vs. unreserved entries), but the same key gets a fresh widget
+	-- once a sort moves it out of here into its real slot, and pooling by
+	-- plain entry.key would otherwise hand that new widget a stale point
+	-- left over from its time in this grid.
+	local function RenderNewItemsArea(y, groupKey, usedKeys, usedLabels, newItems)
+		if #newItems == 0 then
+			return y
+		end
+
+		local fs = AcquireLabel(groupKey.."sub:NewItems", "GameFontNormalSmall")
+		fs:ClearAllPoints()
+		fs:SetPoint("TOPLEFT", content, "TOPLEFT", 0, y)
+		fs:SetText("New Items")
+		fs:Show()
+		usedLabels[groupKey.."sub:NewItems"] = true
+
+		local itemY = y - SUBCAT_LABEL_HEIGHT
+		local rows = math.ceil(#newItems / NEW_ITEMS_COLS)
+		for i, entry in ipairs(newItems) do
+			local col = (i - 1) % NEW_ITEMS_COLS
+			local row = math.floor((i - 1) / NEW_ITEMS_COLS)
+			local key = "new:"..entry.key
+			local btn = AcquireSlot(key)
+			usedKeys[key] = true
+
+			ConfigureItemSlot(btn, entry)
+
+			btn:ClearAllPoints()
+			btn:SetPoint(
+				"TOPLEFT", content, "TOPLEFT",
+				col * (SLOT_SIZE + SLOT_PAD),
+				itemY - row * (SLOT_SIZE + SLOT_PAD)
+			)
+			btn:Show()
+		end
+
+		return itemY - rows * SLOT_SIZE - (rows - 1) * SLOT_PAD - SECTION_PAD_Y
+	end
+
+	-- Empty and Junk aggregate widgets share one row (New Items is its own
+	-- block, RenderNewItemsArea above -- split out 2026-09-12 once it needed
+	-- to wrap across multiple rows instead of always fitting one),
+	-- positioned between Equipment and Misc to match the user's existing
+	-- Baganator layout, which puts its Recent/Empty row there deliberately
+	-- for ConsolePort nav reasons -- worth revisiting once our own nav-graph
 	-- module (TASKS.md task 1) is real. Junk is never rendered as
 	-- individual slots (DESIGN.md invariant 3) -- Data.lua's Scan already
 	-- pulled junk out into model.junkCount/junkValue rather than creating
 	-- entries for it. In the bank view, junk sitting in the bank can't be
 	-- sold from there directly -- this stays informational (a nudge to
 	-- move it to bags) rather than actionable, same widget either way.
-	local function RenderAggregateRow(y, groupKey, usedKeys, usedLabels, model)
+	local function RenderAggregateRow(y, groupKey, usedLabels, model)
 		local x = 0
-
-		-- Recent uses real item slots (AcquireSlot), not the aggregate-
-		-- badge shape Junk/Quest use -- these are individually actionable
-		-- items you'd actually want to click, not a collapsed count. Keyed
-		-- "recent:"..entry.key rather than entry.key itself (entry.key is
-		-- already globally unique, so no groupKey needed either): the same
-		-- item can legitimately also be showing in its normal category grid
-		-- right now, and that's a different widget (a real WoW Frame can
-		-- only have one position at a time) even though both point at the
-		-- same bag slot underneath.
-		if #model.recentEntries > 0 then
-			local fs = AcquireLabel(groupKey.."sub:Recent", "GameFontNormalSmall")
-			fs:ClearAllPoints()
-			fs:SetPoint("TOPLEFT", content, "TOPLEFT", x, y)
-			fs:SetText("Recent")
-			fs:Show()
-			usedLabels[groupKey.."sub:Recent"] = true
-
-			local itemY = y - SUBCAT_LABEL_HEIGHT
-			for i, entry in ipairs(model.recentEntries) do
-				local key = "recent:"..entry.key
-				local btn = AcquireSlot(key)
-				usedKeys[key] = true
-
-				ConfigureItemSlot(btn, entry)
-
-				btn:ClearAllPoints()
-				btn:SetPoint("TOPLEFT", content, "TOPLEFT", x + (i - 1) * (SLOT_SIZE + SLOT_PAD), itemY)
-				btn:Show()
-			end
-
-			x = x + #model.recentEntries * (SLOT_SIZE + SLOT_PAD) - SLOT_PAD + SUBCAT_PAD_X
-		end
 
 		if model.emptyCount > 0 then
 			local fs = AcquireLabel(groupKey.."sub:Empty", "GameFontNormalSmall")
@@ -1142,22 +1430,39 @@ local function NewBagView(opts)
 		-- anchor instead (see NewBagView).
 		local y = 0
 
-		local sections = GroupEntries(group.model)
+		local state = GetSortState(SelectedGroupIndex())
+		local sections, newItems = GroupEntries(group.model, state)
 		for _, sectionName in ipairs(ns.SECTION_ORDER) do
 			y = RenderSection(
-				"", sectionName, sections[sectionName], y, group.transferTargetBagIDs,
+				"", sectionName, sections[sectionName], y, state,
+				group.transferTargetBagIDs, group.model.getBagIDs,
 				usedKeys, usedSubcatLabels, usedBGs, usedHeaders
 			)
 			if sectionName == "Equipment" then
-				y = RenderAggregateRow(y, "", usedKeys, usedLabels, group.model)
+				y = RenderNewItemsArea(y, "", usedKeys, usedLabels, newItems)
+				y = RenderAggregateRow(y, "", usedLabels, group.model)
 			end
 		end
 
 		RenderCurrencyRow(group.currencyMode)
 
+		-- Render-layer self-check (DESIGN.md "Transfer verification",
+		-- TASKS.md task 10's third mechanism): the hide-unused-widgets pass
+		-- below is what's supposed to keep the visible slot set matching
+		-- usedKeys -- rather than just trust that, fold a direct assertion
+		-- into the same loop it already runs, since a mismatch here (a
+		-- widget shown that shouldn't be, or vice versa) IS a rendered
+		-- ghost, independent of whether model.entries itself is correct.
+		-- Free in practice: same widgets already being visited to decide
+		-- show/hide, one extra IsShown() read each, on an already-debounced,
+		-- already-visibility-gated render pass -- see task 10 for the cost
+		-- reasoning in full.
 		for key, btn in pairs(slotPool) do
-			if not usedKeys[key] then
-				btn:Hide()
+			local shouldShow = usedKeys[key] == true
+			if btn:IsShown() ~= shouldShow then
+				print(("|cffff8080SpeedyBags|r: render mismatch on slot %s -- expected shown=%s, was %s. Correcting.")
+					:format(tostring(key), tostring(shouldShow), tostring(btn:IsShown())))
+				btn:SetShown(shouldShow)
 			end
 		end
 		for key, fs in pairs(labelPool) do
@@ -1232,6 +1537,41 @@ local function NewBagView(opts)
 		depositButton:SetScript("OnLeave", GameTooltip_Hide)
 	end
 
+	-- Manual reflow trigger (DESIGN.md invariant 6 / TASKS.md task 7) --
+	-- one of exactly two things that ever call Sort() (the other is
+	-- view.Hide() below). Sorts and immediately re-renders the currently
+	-- SELECTED group only -- sorting a tab you can't currently see wouldn't
+	-- be observable anyway, and Hide() already guarantees every group gets
+	-- sorted at least once before it can ever be looked at again. Same
+	-- bottom chrome row as the tabs/deposit button, placed after whichever
+	-- of those this view actually has.
+	do
+		local sortButtonX = MARGIN
+		if hasTabs then
+			sortButtonX = sortButtonX + #opts.groups * (TAB_WIDTH + 6)
+		end
+		if opts.depositButton then
+			sortButtonX = sortButtonX + 140 + 6
+		end
+
+		local sortButton = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+		sortButton:SetSize(80, CURRENCY_ROW_HEIGHT)
+		sortButton:SetText("Sort")
+		sortButton:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", sortButtonX, MARGIN)
+		sortButton:SetScript("OnClick", function()
+			Sort(GetSortState(SelectedGroupIndex()), SelectedGroup().model)
+			Refresh()
+		end)
+		sortButton:SetScript("OnEnter", function(self)
+			GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+			GameTooltip:SetText("Sort")
+			GameTooltip:AddLine("Gives every New Item a permanent place in its category."
+				.." Layout otherwise never changes while this window is open.", 1, 1, 1, true)
+			GameTooltip:Show()
+		end)
+		sortButton:SetScript("OnLeave", GameTooltip_Hide)
+	end
+
 	local view = { Frame = frame }
 
 	-- Does NOT re-scan on open (corrected 2026-08-17, user correction) --
@@ -1250,8 +1590,23 @@ local function NewBagView(opts)
 		Refresh()
 	end
 
+	-- Sort runs HERE, at close, not on the next Show() -- DESIGN.md
+	-- invariant 6 / TASKS.md task 7, corrected 2026-09-12 per the user's own
+	-- reasoning: sorting on open would delay opening the window (the exact
+	-- "recompute it every time you open the container" cost this addon
+	-- exists to not have), and tying it to close instead is also what makes
+	-- an item that first appears while the view is closed correctly wait
+	-- for the *next* close rather than being pre-sorted before the
+	-- following open. Every group gets sorted, not just the selected one --
+	-- Refresh() only ever renders the selected tab, but there's no reason
+	-- the OTHER tab's New Items should still be sitting unsorted next time
+	-- it's actually looked at. Hiding first, sorting after, is safe either
+	-- way here: Sort() never touches a widget, only sortStates.
 	function view.Hide()
 		frame:Hide()
+		for i, group in ipairs(opts.groups) do
+			Sort(GetSortState(i), group.model)
+		end
 	end
 
 	function view.Toggle()

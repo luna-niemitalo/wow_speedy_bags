@@ -77,12 +77,15 @@ end
 -- "merged" means here. Equipment needs a real per-instance identity since
 -- two identical rings are two different actionable items; C_Item.GetItemGUID
 -- is stable across slot moves, unlike bag/slot itself.
+-- Second return is the raw GUID (equipment only, nil otherwise) -- Verify.lua
+-- needs the bare value to compare against C_Item.GetItemGUID's own return
+-- shape, not the "guid:"-prefixed display key.
 local function EntryKey(itemID, isEquipment, bagID, slot)
 	if isEquipment then
 		local guid = C_Item.GetItemGUID(ItemLocation:CreateFromBagAndSlot(bagID, slot))
-		return "guid:" .. tostring(guid)
+		return "guid:" .. tostring(guid), guid
 	end
-	return "item:" .. tostring(itemID)
+	return "item:" .. tostring(itemID), nil
 end
 
 -- Scans the given list of bag IDs into display entries, merging same-
@@ -174,8 +177,10 @@ local function Scan(bagIDs)
 							entry.count = entry.count + stackCount
 							table.insert(entry.locations, { bag = bagID, slot = slot, count = stackCount })
 						else
+							local key, guid = EntryKey(itemID, isEquipment, bagID, slot)
 							entry = {
-								key = EntryKey(itemID, isEquipment, bagID, slot),
+								key = key,
+								guid = guid,
 								itemID = itemID,
 								itemLink = info.hyperlink,
 								icon = info.iconFileID,
@@ -232,77 +237,24 @@ end
 -- tabs are currently purchased, which can change mid-session -- re-deriving
 -- it on every Update() rather than caching keeps that single-sourced
 -- instead of needing its own change-tracking.
--- How long an item stays in the Recent row after it's noticed, and the
--- most items that row ever shows at once (sorted newest-first, per
--- NewRecentTracker below -- oldest of an overflowing bunch just doesn't
--- render, same capped-display idea as ICON_STACK_CAP for Junk/Quest).
-local RECENT_WINDOW_SECONDS = 300
-local RECENT_ICON_CAP = 6
-
--- "Recent" isn't a real tracked WoW concept the way isQuestItem/isJunk
--- are -- Blizzard's own C_NewItems.IsNewItem can't be reused for it here:
--- UI.lua's ClearNewItemGlow already calls RemoveNewItem on every single
--- render (to suppress the glow defaulting to shown-on-everything after a
--- reload, since we never run the default bag UI's own hover-driven clear
--- path) which would immediately erase that flag as a signal the moment
--- this model tried to read it. So this keeps its own notion of "recent"
--- instead: an item is recent if it's new to this model's own scan history
--- (a key that wasn't present last Update) or its count went up (looted
--- more of something already held), timestamped with GetTime() and pruned
--- once RECENT_WINDOW_SECONDS old. Session-only by design, not persisted
--- to SavedVariables -- "recent" stops meaning anything across a reload
--- anyway.
-local function NewRecentTracker()
-	local seenAt = {} -- key -> GetTime() it was last (re-)noticed
-	local previousCounts = {} -- key -> count, from the prior scan
-	-- Without this, the very first scan (addon load / first bag open, when
-	-- previousCounts is still empty) would see every single entry as
-	-- "new" -- there's no prior baseline yet to diff against, not because
-	-- anything actually just arrived -- and flag the whole bag as Recent
-	-- at once. One scan just establishes the baseline instead.
-	local hasScannedBefore = false
-
-	-- @return recentEntries: up to RECENT_ICON_CAP entries, newest-noticed
-	--   first -- already exactly what UI.lua's Recent row needs to render.
-	return function(entries)
-		local now = GetTime()
-		local currentCounts = {}
-
-		for _, entry in ipairs(entries) do
-			currentCounts[entry.key] = entry.count
-			if hasScannedBefore then
-				local previous = previousCounts[entry.key]
-				if not previous or entry.count > previous then
-					seenAt[entry.key] = now
-				end
-			end
-		end
-		previousCounts = currentCounts
-		hasScannedBefore = true
-
-		for key, noticedAt in pairs(seenAt) do
-			if now - noticedAt > RECENT_WINDOW_SECONDS then
-				seenAt[key] = nil
-			end
-		end
-
-		local recent = {}
-		for _, entry in ipairs(entries) do
-			if seenAt[entry.key] then
-				table.insert(recent, entry)
-			end
-		end
-		table.sort(recent, function(a, b) return seenAt[a.key] > seenAt[b.key] end)
-		while #recent > RECENT_ICON_CAP do
-			table.remove(recent)
-		end
-
-		return recent, next(seenAt) ~= nil
-	end
-end
-
+-- "New Items" is no longer a data-layer concept tracked here (removed
+-- 2026-09-12, see DESIGN.md invariant 6 / TASKS.md task 7): it used to be a
+-- count-diffing heuristic (NewRecentTracker) with its own timer-driven
+-- expiry, but that expiry was itself a silent reflow trigger under the new
+-- "layout only changes at an explicit sort" invariant -- an item can't be
+-- allowed to move from staging into its category grid just because a clock
+-- ran out. Whether an entry is "new" (unplaced) is now purely a function of
+-- UI.lua's own per-view reservation table (does this entry.key have an
+-- assigned grid slot yet, or is it still waiting for the next sort) -- see
+-- UI.lua's Sort()/NewItemsFor(). Nothing here needs to guess "recently
+-- seen" anymore; the render layer already knows definitively.
 function ns.NewModel(getBagIDs)
 	local model = {
+		-- Exposed so callers outside this file (Transfer.lua/Verify.lua) can
+		-- ask "which bags does this model actually cover" without duplicating
+		-- the bag-ID logic themselves -- e.g. verifying a move needs the
+		-- source model's own bag list, not just the transfer's target list.
+		getBagIDs = getBagIDs,
 		entries = {},
 		emptyCount = 0,
 		junkCount = 0,
@@ -310,33 +262,18 @@ function ns.NewModel(getBagIDs)
 		junkItems = {},
 		questCount = 0,
 		questItems = {},
-		recentEntries = {},
 	}
 
 	local listeners = {}
-	local CollectRecent = NewRecentTracker()
-	local recentExpiryPending = false
 
 	function model.OnChanged(fn)
 		table.insert(listeners, fn)
 	end
 
 	function model.Update()
-		local pawnPending, hasRecent
+		local pawnPending
 		model.entries, model.emptyCount, model.junkCount, model.junkValue, model.junkItems,
 			model.questCount, model.questItems, pawnPending = Scan(getBagIDs())
-		model.recentEntries, hasRecent = CollectRecent(model.entries)
-		if hasRecent and not recentExpiryPending then
-			-- Nothing else guarantees another Update() runs once
-			-- RECENT_WINDOW_SECONDS passes with no further bag activity --
-			-- without this, an item that became recent and then nothing
-			-- else happened would just stay in the Recent row forever.
-			recentExpiryPending = true
-			C_Timer.After(RECENT_WINDOW_SECONDS + 1, function()
-				recentExpiryPending = false
-				model.Update()
-			end)
-		end
 		if pawnPending then
 			-- Pawn couldn't answer for at least one item this pass (its own
 			-- per-frame throttle, see Pawn.lua) -- one short deferred re-scan

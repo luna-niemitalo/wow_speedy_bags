@@ -7,8 +7,8 @@ local _, ns = ...
 --
 -- Section order (top to bottom) matches the user's own working Baganator
 -- layout, described directly rather than reverse-engineered from a custom
--- config: Crafting, Equipment, (Recent/Empty row), Misc, Old Stuff. The
--- Recent/Empty row sits in the middle deliberately, for ConsolePort nav
+-- config: Crafting, Equipment, (New Items/Empty/Junk/Quest row), Misc, Old
+-- Stuff. That row sits in the middle deliberately, for ConsolePort nav
 -- reasons on the user's existing setup -- worth revisiting once our own
 -- nav-graph module (TASKS.md task 1) is real; UI.lua renders it, not this
 -- file.

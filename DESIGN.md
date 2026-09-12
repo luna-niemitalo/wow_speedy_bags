@@ -68,6 +68,77 @@ approach can't satisfy one, the approach is wrong, not the invariant.
    invariant 1's `nodeignore`/`nodepriority` tagging discipline is still applied to
    every frame regardless — the graph doesn't replace that discipline, it sits in
    front of it.
+   **Correction, 2026-09-12** (user report: "the console port ui cursor still
+   doesn't register the menu as a valid target to navigate to/from" — confirmed by
+   investigation, see `TASKS.md` task 1's addendum): `nodeignore`/`nodepriority`
+   tagging, and the future nav graph, are both moot for a frame ConsolePort never
+   scans in the first place. There is a *gate* in front of ConsolePortNode's
+   geometric search that invariant 1's original resolution missed entirely — ADDING
+   `SpeedyBagsFrame`/`SpeedyBagsBankFrame` to ConsolePort's cursor-navigable frame
+   stack (`ConsolePort:AddInterfaceCursorFrame`, see `TASKS.md` task 1) is a
+   **prerequisite** for invariant 1 and 5 to have any effect at all, not an
+   orthogonal nice-to-have.
+6. **Layout position is identity-keyed and frozen between sorts; nothing already
+   on screen moves while a view is open.** Added 2026-09-12, user-directed hard constraint
+   ("no layout reflows while the bag is open, ever, under any conditions"), refined
+   the same day into a precise, two-part mechanism once the user answered the
+   masonry-tension question below:
+   - **Exactly two triggers ever cause a reflow, both a deliberate "re-sort now"
+     action, never a side effect of ordinary play**: the view being closed (the
+     sort runs at close time, not on the next open — opening must stay instant,
+     and this is also what makes an item that appears while the view is closed
+     land in New Items rather than getting sorted: nothing sorts again until the
+     *next* close), and a manual "Sort" button clicked while it's still open. No
+     event, timer, or count change reflows anything on its own, and opening the
+     view never itself triggers a sort.
+   - **A category/subcategory position, and an item's grid cell within it, are
+     identity-keyed and sticky for the duration of ONE open session** — "if an
+     item has a slot, that location is reserved for it" (user's own framing),
+     literally: the reservation survives the item's count dropping to zero (an
+     empty, still-reserved cell, not backfilled by reflowing a neighbor into the
+     gap) and applies again the moment a matching item (same identity) is
+     reacquired, even mid-session — "if I use the last item from a specific
+     spot, and then ... acquire a new item of matching material, that should
+     automatically fall into that slot even if the slot is technically empty."
+     **Correction, same day**: this stickiness is bounded by the next sort, not
+     permanent — the user asked directly whether a dead reservation (an item no
+     longer owned at all) ever gets reclaimed, and the honest answer was no, it
+     sat there until `/reload`. Since a sort is already one of the only two
+     allowed reflow points, it's also the right point to compact: every sort
+     recomputes each touched subcategory's membership from what's actually
+     owned right now, dropping reservations for anything no longer present and
+     compacting the rest down, rather than only ever appending. A subcategory
+     that becomes completely empty stops reserving a column/header at all. The
+     mid-session promise above still holds exactly as stated — it just means
+     "until the next sort," not "forever."
+   - **An item with no existing reservation is not placed into its category grid
+     at all** — it lands in the New Items area instead, and stays there until one
+     of the two triggers above runs a real sort. This is what keeps the "no
+     reflow while open" promise honest: a genuinely new item can't reflow its
+     category into a new shape if it never enters that category's grid before the
+     next real sort.
+   - **The New Items area is the one place still allowed to reflow on its own**,
+     because it's explicitly a bounded staging area, not a semantic category —
+     when it runs out of room it may repack/wrap/shrink internally to fit more,
+     independent of the two triggers above.
+   - **A sort should not treat every subcategory as equally movable** — "larger
+     objects / larger categories like crafting materials should be more reluctant
+     against being moved by reflow": the sort algorithm biases toward keeping a
+     large/dense subcategory's previous column, only displacing it when the
+     imbalance is large enough to be worth it, while small subcategories flow
+     freely to fill whatever's left. A full from-scratch masonry pack (ignoring
+     the previous layout entirely, as `UI.lua` does today) doesn't have this
+     property — it needs the previous assignment as an input, not just current
+     entry counts. Exact weighting is a tuning knob, not decided here.
+
+   This resolves the tension with the masonry-by-live-size packing added
+   2026-08-17 (`UI.lua`'s `RenderSection`/`SubcatCols`/`OrderedSubcats`, which
+   recomputes on every model change, not just on a deliberate sort): masonry's
+   packing algorithm itself is still useful, just relocated — it now runs only at
+   the two sort triggers, seeded by the previous layout (for the size-weighted
+   stickiness above) rather than from a blank slate every render. See `TASKS.md`
+   task 7 for the full mechanism (reservation table, New Items staging, Sort
+   button, size-weighted resort).
 
 ## Target architecture (sketch — not yet built)
 
@@ -93,6 +164,23 @@ approach can't satisfy one, the approach is wrong, not the invariant.
   mechanism — see invariant 5 and `TASKS.md` task 1.
 - **Render layer**: subscribes to data-layer diffs, patches only affected slots.
   Never a full-frame rebuild in the hot path (loot/vendor/mail/unbox).
+- **Layout-position layer**: an identity-keyed slot-reservation table
+  (section/subcategory → column, item key → grid index within its subcategory),
+  written only by an explicit sort pass (at view-**close** time, or a manual
+  "Sort" button while open — never on open, which must stay instant) and
+  otherwise read-only — an item with no reservation renders in the New Items
+  staging area instead of its category, until the next sort. See
+  invariant 6 and `TASKS.md` task 7. Sits between the data layer and the render
+  layer: the render layer still repaints a slot's texture/count/tooltip on every
+  relevant change, but never re-derives *where* a slot sits outside a sort pass.
+  Not yet built — masonry-by-live-size (`UI.lua`'s current `RenderSection`, which
+  repacks on every model change) is what's actually shipped, and it violates
+  invariant 6.
+- **ConsolePort frame registration**: every top-level SpeedyBags frame calls
+  `ConsolePort:AddInterfaceCursorFrame(frame)` (existence-guarded — soft
+  integration, same pattern as `Junk.lua`/`Pawn.lua`) at creation, so ConsolePort's
+  cursor stack ever considers its children as nav candidates at all — see
+  invariant 5's 2026-09-12 correction and `TASKS.md` task 1. Not yet built.
 
 ## Rejected / deferred alternatives
 
@@ -139,6 +227,108 @@ both happen to be present, without making either mandatory.
   exists. Nav graph and cursor stability from the invariants above are not built yet.
 - **Target**: see architecture sketch above. Nav graph (invariant 5) is blocked on
   `TASKS.md` tasks 1/2.
+
+## Default-UI suppression must be structural, not a global-function hook
+
+**Found 2026-09-12** (user report: Blizzard's own bag UI still opens in some
+situations — the Item Upgrade view specifically — "and is impossible to close
+without reloading the UI"), confirmed by reading real client source
+(`references/wow-ui-source/`): `SpeedyBags.lua`'s redefinition of
+`ToggleBackpack`/`ToggleAllBags`/`ToggleBag`/`OpenAllBags`/`CloseAllBags` only
+intercepts code that calls exactly those five globals. It is not the only way
+Blizzard's own UI opens the real bag frame:
+
+- `Blizzard_ItemUpgradeUI/Mainline/Blizzard_ItemUpgradeUI.lua` calls
+  `ItemButtonUtil.OpenAndFilterBags`/`CloseFilteredBags`
+  (`Blizzard_FrameXMLUtil/ItemUtil.lua`), which calls
+  `OpenAllBagsMatchingContext` (`Blizzard_UIPanels_Game/.../ContainerFrame.lua`),
+  which calls the raw internal `OpenBag(i)` directly — none of our five
+  redefined globals are in that call chain, so the real
+  `ContainerFrameCombinedBags`/`ContainerFrame1..6` opens unsuppressed.
+- Once open that way, it can't be closed through our UI either:
+  `CloseFilteredBags` (and Escape, via `UIParentPanelManager`'s
+  `CloseAllWindows` → the global `CloseAllBags()`) both route through the same
+  global `CloseAllBags` we redefined to only hide `ns.Frame` — Blizzard's real
+  frame is left showing with nothing left in the chain able to hide it.
+  `ContainerFrameCombinedBags`/`ContainerFrame1..6` are also not in
+  `UISpecialFrames`, so there's no independent Escape-to-close fallback either.
+  (Separately, `Blizzard_ItemInteractionUI` — the Catalyst-style flow — calls
+  the global `OpenAllBags`/`CloseAllBags` directly and IS correctly intercepted
+  today; the Item Upgrade UI's `OpenBag`-based path is the one that isn't.)
+
+**The lesson generalizes past this one call site**: global-function redefinition
+is a compatibility shim for the *common* entry points, not a suppression
+mechanism — anything with its own more direct path to the real frame walks
+straight past it. `Bank.lua`'s `HideDefaultBank` (below) already uses the
+correct, general technique for the bank frame — structural suppression
+(`SetParent` onto a hidden frame, scripts cleared) — precisely because it
+doesn't care which code path tried to show the frame. The regular bag frame
+never got the same treatment; that's the actual gap, not a missing hook for
+this one specific Item Upgrade call site. Confirmed against Baganator/BetterBags'
+own real, shipped code: both suppress `ContainerFrameCombinedBags`/
+`ContainerFrame1..6` structurally, the identical way they (and we) already
+suppress `BankFrame` — BetterBags additionally special-cases
+`Enum.PlayerInteractionType.ItemUpgrade` in its own interaction-event table,
+confirming this is a known, real-world trigger other addons had to handle too,
+not an edge case unique to us.
+
+**Fix** (not yet implemented — see `TASKS.md` task 8): a `HideDefaultBags()` in
+`SpeedyBags.lua` mirroring `Bank.lua`'s `HideDefaultBank()` exactly — reparent
+`ContainerFrame1..6` and `ContainerFrameCombinedBags` onto a hidden frame and
+clear their `OnShow`/`OnHide`/`OnEvent` scripts at load. This closes the gap for
+every current and future code path, not just the one that was actually caught.
+Separately (a real but related gap, not the same bug): `SpeedyBagsFrame` and
+`SpeedyBagsBankFrame` are not registered in `UISpecialFrames` either, so Escape
+does not close *our own* frames independently of the `CloseAllBags`-global
+compatibility shim — should be added alongside the structural suppression fix.
+
+## Transfer verification (ghost-item reconciliation)
+
+**Added 2026-09-12** (user report: multi-item bag→bank transfers "often" leave
+ghost items behind — a persistence beyond what the earlier single trailing
+`RescanAllModels()` fix in `Transfer.lua` catches). Full design in `TASKS.md`
+task 10; the shape of it as an invariant:
+
+- **Every move `Transfer.lua` initiates is verified against a per-item
+  assertion** ("item X is gone from the source, present in the destination"),
+  not just re-rendered from whatever the model happens to show afterward. The
+  assertion is identity-scoped — a GUID for equipment, an itemID + expected
+  count-delta for stackables (see task 10's open question on why stackables
+  can't always use a bare GUID) — never a loose "does this itemID exist
+  somewhere in the target bags now" check, which can't distinguish the item
+  actually moved from an unrelated existing stack.
+- **Verification retries the specific stuck item, not the whole batch.** A
+  fast (~300ms) poll loop runs only while at least one item's move is
+  unconfirmed, re-attempts a failed pickup/place up to a small capped number
+  of times, and forces a real model rescan (not just a render) before
+  concluding an item is missing or duplicated — most "ghost" sightings are
+  exactly that: a stale cached model, not a real duplicate or a real loss.
+- **A slow (~5s) background pass keeps the rest of inventory state honest
+  independent of events**, on the working assumption that a missed/unexpected
+  event (not a flaw in `Data.lua`'s `Scan` itself, which is already correct
+  when it runs) is the actual root cause of ghosts that don't go through
+  `Transfer.lua` at all (plain drag-and-drop). This is deliberately not
+  real-time and never touches the render path — see invariant 4, which this
+  strengthens rather than replaces: bulk operations already must not block the
+  UI; this adds "and must eventually be provably correct," on a background
+  cadence, not a synchronous one.
+- **Correction, same day**: the two mechanisms above only verify real game
+  state against `model.entries` (the data layer) — a ghost is a *rendered*
+  phenomenon, and neither one checks that the actually-visible widget set
+  agrees with `model.entries` (the render layer). A third piece closes that:
+  every forced data update also forces its view's `Refresh()` rather than
+  trusting the existing debounce to fire, and `Refresh()` itself gains a
+  standing self-check (its own hide-unused-widgets pass gets audited against
+  what it just computed as "should be visible," every render, not just during
+  active verification) — printing and correcting any mismatch, per
+  `~/.claude/CLAUDE.md`'s foreign-data discipline of always stating expected
+  vs. actual on failure, rather than trusting a render-layer invariant that's
+  already been proven wrong once. Without this piece, a render-layer bug
+  entirely unrelated to data staleness would never be caught no matter how
+  often the data layer is re-verified.
+
+Not yet implemented — recorded here as the target invariant, with the
+mechanism itself in `TASKS.md` task 10.
 
 ## Boundaries
 

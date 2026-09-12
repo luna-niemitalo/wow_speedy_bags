@@ -25,6 +25,7 @@ Pawn.lua
 Currency.lua
 Data.lua
 Bank.lua
+Verify.lua
 Transfer.lua
 UI.lua
 SpeedyBags.lua

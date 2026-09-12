@@ -1,5 +1,59 @@
 local ADDON_NAME, ns = ...
 
+---------------------------------------------------------------
+-- Suppressing Blizzard's own default bag window
+---------------------------------------------------------------
+-- Mirrors Bank.lua's HideDefaultBank exactly, for the regular bag frame.
+-- Found necessary 2026-09-12 (user report: Blizzard's own bag UI still opens
+-- in some situations -- the Item Upgrade view specifically -- and is
+-- impossible to close without /reload): the global-function redefinitions
+-- below (ToggleBackpack/ToggleAllBags/etc.) only intercept code that calls
+-- exactly those globals. Blizzard_ItemUpgradeUI opens bags via
+-- ItemButtonUtil.OpenAndFilterBags -> OpenAllBagsMatchingContext -> the raw
+-- internal OpenBag(i), which none of those five globals are anywhere in the
+-- call chain of -- confirmed by reading real client source (see DESIGN.md's
+-- "Default-UI suppression must be structural" section). Closing is worse:
+-- CloseFilteredBags and Escape (via UIParentPanelManager's CloseAllWindows)
+-- both route back through the global CloseAllBags(), which this file
+-- redefines to only hide OUR frame -- leaving Blizzard's real one stuck open
+-- with nothing left in the chain able to hide it, and it isn't in
+-- UISpecialFrames either, so there's no independent Escape fallback.
+-- Structural suppression (reparent + clear scripts, matching Baganator's
+-- ViewManagement/Initialize.lua HideDefaultBackpack and BetterBags'
+-- core/init.lua HideBlizzardBags, both confirmed real shipped code) closes
+-- this for every current and future code path, not just the one caught here.
+local hiddenBagHolder = CreateFrame("Frame")
+hiddenBagHolder:Hide()
+
+local function HideDefaultBags()
+	for i = 1, 6 do
+		local containerFrame = _G["ContainerFrame"..i]
+		if containerFrame then
+			containerFrame:SetParent(hiddenBagHolder)
+			containerFrame:SetScript("OnShow", nil)
+			containerFrame:SetScript("OnHide", nil)
+			containerFrame:SetScript("OnEvent", nil)
+		end
+	end
+	if ContainerFrameCombinedBags then
+		ContainerFrameCombinedBags:SetParent(hiddenBagHolder)
+		ContainerFrameCombinedBags:SetScript("OnShow", nil)
+		ContainerFrameCombinedBags:SetScript("OnHide", nil)
+		ContainerFrameCombinedBags:SetScript("OnEvent", nil)
+	end
+end
+HideDefaultBags()
+
+-- Escape closing OUR frames directly, independent of the CloseAllBags-global
+-- compatibility shim below -- a related but separate gap (confirmed absent
+-- 2026-09-12): neither SpeedyBagsFrame nor SpeedyBagsBankFrame was registered
+-- anywhere for Escape-to-close. UISpecialFrames just wants the frame's own
+-- global name; both are already named globals (UI.lua's CreateFrame calls
+-- pass opts.name), and UI.lua loads before this file per the .toc order, so
+-- both already exist by the time this runs.
+tinsert(UISpecialFrames, "SpeedyBagsFrame")
+tinsert(UISpecialFrames, "SpeedyBagsBankFrame")
+
 local bootstrap = CreateFrame("Frame")
 bootstrap:RegisterEvent("ADDON_LOADED")
 bootstrap:RegisterEvent("BAG_UPDATE")
